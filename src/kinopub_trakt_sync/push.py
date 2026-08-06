@@ -133,8 +133,9 @@ def push_progress(plan: dict, client: TraktClient, dry_run: bool) -> None:
                 "progress": entry["percent"],
             }
         outcome = client.scrobble_pause(body)
-        state["pushed"].append(f"progress:{_progress_key(entry)}")
-        config.save_json(config.STATE_FILE, state)
+        if outcome != "rejected":
+            state["pushed"].append(f"progress:{_progress_key(entry)}")
+            config.save_json(config.STATE_FILE, state)
         print(f"  {entry['title']} -> {entry['percent']}% ({outcome})")
         time.sleep(1)
 

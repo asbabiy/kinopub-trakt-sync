@@ -33,8 +33,9 @@ def iso(ts) -> str:
 def _percent(time_watched: int, duration: int) -> float | None:
     if not duration or not time_watched:
         return None
-    percent = round(min(time_watched / duration * 100, 99.0), 1)
-    # Trakt rejects scrobbles below 1%.
+    # Trakt rejects a pause below 1% and at >=80% (its "finished" threshold),
+    # so unfinished items cap at 79.9 to stay recorded as in-progress.
+    percent = round(min(time_watched / duration * 100, 79.9), 1)
     return percent if percent >= 1 else None
 
 

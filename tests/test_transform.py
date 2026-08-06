@@ -69,7 +69,8 @@ def test_imdb_id_normalization():
 def test_percent_bounds():
     assert transform._percent(0, 6000) is None
     assert transform._percent(10, 6000) is None  # below 1%
-    assert transform._percent(6000, 6000) == 99.0  # capped, watched is handled by status
+    assert transform._percent(6000, 6000) == 79.9  # capped below Trakt's 80% finished threshold
+    assert transform._percent(4830, 6000) == 79.9  # 80.5% raw
     assert transform._percent(3000, 0) is None
 
 
