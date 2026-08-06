@@ -84,6 +84,32 @@ percent against the live account and reports missing / extra / mismatched.
 - **`first_seen`** — Trakt stores one datetime per play; the completion moment
   (`updated`) is what "watched at" means.
 
+## kino.pub API surface (probed, not just documented)
+
+The API was probed beyond its docs (~130 candidate paths). **Mutations in this
+API are performed via GET** (`/v1/items/vote`, `/v1/watching/toggle`,
+`/v1/watching/marktime`, `/v1/history/clear-*`), so any probing must exclude
+write-verb paths — a blind sweep corrupts the account.
+
+Result: no undocumented personal-data endpoint exists. Everything carrying a
+user signal is already consumed by `pull`:
+
+| Endpoint | Personal signal |
+|---|---|
+| `/v1/history` | per item: `time`, `first_seen`, `last_seen`, `counter` |
+| `/v1/watching?id=` | per episode: `status`, `time`, `updated` |
+| `/v1/watching/movies`, `/v1/watching/serials` | unfinished items, watchlist |
+| `/v1/bookmarks`, item field `bookmarks` | user folders (empty for this account) |
+| `/v1/user` | username, reg date, subscription, `show_erotic`/`show_uncertain` |
+| `/v1/device` | device list with `last_seen` — session metadata, not watch data |
+
+Absent everywhere: the user's own votes (item payloads expose only community
+`rating`/`rating_percentage`/`rating_votes`; `views` is global), any per-user
+play count, and any rewatch log. `/v1/history` ignores `type`/`media` filters
+and caps `perpage` at 50. No `/v2`, no stats, notifications, or
+recommendations endpoints. `/v1/items/{id}` additionally serves `similar`,
+`comments`, and `trailer` — all catalog data.
+
 ## kino.pub API notes
 
 Documented at <https://kinoapi.com>. Endpoints used: `/v1/history` (paginated view
