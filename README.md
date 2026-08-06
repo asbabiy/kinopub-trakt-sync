@@ -23,6 +23,11 @@ uncertain is reported as `unmatched`, never guessed.
 uv sync
 ```
 
+Python 3.12+, `uv` for everything. The pipeline is async end to end (httpx +
+asyncio), the domain is pydantic models validated at the API boundary, the CLI
+is typer, and identity matching uses Gemini with a pydantic response schema.
+`ruff check` and `basedpyright` (strict) both run clean.
+
 No registration or paid tier is needed on either side. Both services authorize
 via OAuth device-code flow, whose security rests on your own sign-in rather than
 on a secret client key, so both sides ship with the public client credentials
@@ -63,6 +68,13 @@ percent against the live account and reports missing / extra / mismatched.
   it is a small service, more invites 429s/bans), Trakt catalog/history GETs
   (semaphore 8 within Trakt's 1000-per-5-min budget), and Gemini season
   matching. Trakt POSTs stay serialized at 1 rps — a hard API limit.
+- **Reconciliation is cached.** Model decisions are stored per season
+  fingerprint (resolved show + exact kino.pub episode composition), so a repeat
+  `plan` costs no tokens and returns the same mapping; new episodes change the
+  fingerprint and re-ask.
+- **`push_state.json` key formats are a compatibility surface** — they are what
+  makes a re-run idempotent on an already synced account. `models.py` owns them
+  and a test locks them.
 - **Progress** is pushed via `/scrobble/pause` (the only Trakt API that sets
   playback position), one request per item at 1 rps.
 - **Rate limits.** Trakt POSTs run at 1/s with `Retry-After` handling; history is

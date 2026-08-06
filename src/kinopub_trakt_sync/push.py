@@ -1,176 +1,174 @@
 """Apply a sync plan to Trakt.
 
-Idempotency: Trakt does NOT dedupe history plays, so every pushed entry is
-recorded in data/push_state.json and skipped on re-runs. Additionally,
-items already watched on Trakt (fetched via /sync/watched) are skipped, so
-running against a non-empty Trakt account will not double existing plays.
+Idempotency has two layers, because Trakt does not deduplicate history plays:
+locally, every pushed entry is recorded in data/push_state.json and skipped on
+re-runs; remotely, items already watched on the account are skipped too, so a
+first run against a non-empty account does not double existing plays.
 """
 
-import asyncio
+from __future__ import annotations
 
-from . import config
+import asyncio
+import logging
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from .models import EpisodeWatch, MovieWatch, Plan, Progress, ShowRef, Target, WatchlistShow
+from .storage import read_model, write_model
 from .trakt import TraktClient
 
+log = logging.getLogger(__name__)
+
 HISTORY_CHUNK = 500
+WRITE_INTERVAL_SECONDS = 1  # Trakt hard-limits writes to 1 per second
 
 
-def episode_key(entry: dict) -> str:
-    # Keyed by kino.pub identity: stable across re-plans even if the Trakt
-    # target of an entry is later remapped.
-    return f"episode:{entry['imdb']}:{entry['season']}:{entry['episode']}"
+class PushState(BaseModel):
+    """Which plan entries already reached Trakt.
+
+    Sole owner of the key format: everything else asks an entry for its
+    `state_key`, so push and verify can never drift apart.
+    """
+
+    pushed: list[str] = []
+    not_found: list[dict[str, Any]] = []
+
+    @classmethod
+    def load(cls, path: Path) -> PushState:
+        return read_model(path, cls) or cls()
+
+    def save(self, path: Path) -> None:
+        write_model(path, self)
+
+    def __contains__(self, entry: MovieWatch | EpisodeWatch | Progress | WatchlistShow) -> bool:
+        return entry.state_key in set(self.pushed)
+
+    def record(self, entries: Iterable[MovieWatch | EpisodeWatch | Progress | WatchlistShow]) -> None:
+        self.pushed.extend(entry.state_key for entry in entries)
 
 
-def target(entry: dict) -> tuple:
-    """(show ref, season, episode) on Trakt — remapped when reconcile did."""
-    t = entry.get("target")
-    if t:
-        return (t["show"], t["season"], t["episode"])
-    return (entry["imdb"], entry["season"], entry["episode"])
-
-
-def show_ids(ref) -> dict:
-    return {"trakt": ref} if isinstance(ref, int) else {"imdb": ref}
-
-
-def history_payload(movies: list, episodes: list) -> dict:
-    body: dict = {}
+def history_payload(movies: list[MovieWatch], episodes: list[EpisodeWatch]) -> dict[str, Any]:
+    body: dict[str, Any] = {}
     if movies:
         body["movies"] = [
-            {"watched_at": m["watched_at"], "ids": {"imdb": m["imdb"]}} for m in movies
+            {"watched_at": movie.watched_at, "ids": {"imdb": movie.imdb}} for movie in movies
         ]
     if episodes:
-        shows: dict = {}
-        for e in episodes:
-            show, season, number = target(e)
-            seasons = shows.setdefault(show, {})
-            seasons.setdefault(season, []).append(
-                {"number": number, "watched_at": e["watched_at"]}
+        shows: dict[ShowRef, dict[int, list[dict[str, Any]]]] = {}
+        for entry in episodes:
+            target = entry.trakt
+            seasons = shows.setdefault(target.show, {})
+            seasons.setdefault(target.season, []).append(
+                {"number": target.episode, "watched_at": entry.watched_at}
             )
         body["shows"] = [
             {
-                "ids": show_ids(show),
-                "seasons": [{"number": n, "episodes": eps} for n, eps in sorted(seasons.items())],
+                "ids": Target(show=show, season=0, episode=0).ids,
+                "seasons": [
+                    {"number": number, "episodes": episodes}
+                    for number, episodes in sorted(seasons.items())
+                ],
             }
             for show, seasons in shows.items()
         ]
     return body
 
 
-def _load_state() -> dict:
-    if config.STATE_FILE.exists():
-        return config.load_json(config.STATE_FILE)
-    return {"pushed": [], "not_found": []}
+def progress_payload(entry: Progress) -> dict[str, Any]:
+    if (target := entry.trakt) is None:
+        return {"movie": {"ids": {"imdb": entry.imdb}}, "progress": entry.percent}
+    return {
+        "show": {"ids": target.ids},
+        "episode": {"season": target.season, "number": target.episode},
+        "progress": entry.percent,
+    }
 
 
-async def _watched_on_trakt(client: TraktClient) -> tuple[set, set]:
-    movies = set()
-    for entry in await client.watched("movies"):
-        for ref in ((entry.get("movie") or {}).get("ids") or {}).values():
-            movies.add(ref)
-    episodes = set()
-    for entry in await client.watched("shows"):
-        ids = (entry.get("show") or {}).get("ids") or {}
-        for season in entry.get("seasons") or []:
-            for ep in season.get("episodes") or []:
-                for ref in (ids.get("imdb"), ids.get("trakt")):
-                    if ref:
-                        episodes.add((ref, season.get("number"), ep.get("number")))
+async def watched_on_trakt(client: TraktClient) -> tuple[set[ShowRef], set[tuple[ShowRef, int, int]]]:
+    """Everything the account already counts as watched, indexed by every id
+    Trakt exposes, so imdb-addressed and trakt-addressed entries both match."""
+    movies: set[ShowRef] = set()
+    for row in await client.watched("movies"):
+        movies.update(ref for ref in ((row.get("movie") or {}).get("ids") or {}).values() if ref)
+
+    episodes: set[tuple[ShowRef, int, int]] = set()
+    for row in await client.watched("shows"):
+        ids = (row.get("show") or {}).get("ids") or {}
+        refs = [ref for ref in (ids.get("imdb"), ids.get("trakt")) if ref]
+        for season in row.get("seasons") or []:
+            for episode in season.get("episodes") or []:
+                episodes.update((ref, season["number"], episode["number"]) for ref in refs)
     return movies, episodes
 
 
-def _chunks(seq: list, size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
+def _chunks[T](items: list[T], size: int) -> Iterator[list[T]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
-async def push_history(plan: dict, client: TraktClient, dry_run: bool) -> None:
-    state = _load_state()
-    pushed = set(state["pushed"])
-    watched_movies, watched_episodes = await _watched_on_trakt(client)
-
-    movies = [
-        m
-        for m in plan["movies_watched"]
-        if f"movie:{m['imdb']}" not in pushed and m["imdb"] not in watched_movies
-    ]
-    episodes = [
-        e
-        for e in plan["episodes_watched"]
-        if episode_key(e) not in pushed and target(e) not in watched_episodes
-    ]
-    skipped = (len(plan["movies_watched"]) - len(movies)) + (
-        len(plan["episodes_watched"]) - len(episodes)
-    )
+async def push_history(
+    plan: Plan, client: TraktClient, state: PushState, state_path: Path, *, dry_run: bool
+) -> None:
+    watched_movies, watched_episodes = await watched_on_trakt(client)
+    movies = [m for m in plan.movies if m not in state and m.imdb not in watched_movies]
+    episodes = [e for e in plan.episodes if e not in state and e.trakt.key not in watched_episodes]
+    skipped = (len(plan.movies) - len(movies)) + (len(plan.episodes) - len(episodes))
     print(f"history: {len(movies)} movies + {len(episodes)} episodes to push, {skipped} already synced")
-    if dry_run or (not movies and not episodes):
+    if dry_run:
         return
 
-    for movie_chunk in _chunks(movies, HISTORY_CHUNK):
-        result = await client.sync_history(history_payload(movie_chunk, []))
-        state["pushed"].extend(f"movie:{m['imdb']}" for m in movie_chunk)
-        state["not_found"].extend(result.get("not_found", {}).get("movies", []))
-        config.save_json(config.STATE_FILE, state)
+    for chunk in _chunks(movies, HISTORY_CHUNK):
+        result = await client.add_to_history(history_payload(chunk, []))
+        state.record(chunk)
+        state.not_found.extend(result.get("not_found", {}).get("movies", []))
+        state.save(state_path)
         print(f"  movies chunk: added {result.get('added', {}).get('movies', 0)}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
-    for episode_chunk in _chunks(episodes, HISTORY_CHUNK):
-        result = await client.sync_history(history_payload([], episode_chunk))
-        state["pushed"].extend(episode_key(e) for e in episode_chunk)
-        state["not_found"].extend(result.get("not_found", {}).get("shows", []))
-        config.save_json(config.STATE_FILE, state)
+    for chunk in _chunks(episodes, HISTORY_CHUNK):
+        result = await client.add_to_history(history_payload([], chunk))
+        state.record(chunk)
+        state.not_found.extend(result.get("not_found", {}).get("shows", []))
+        state.save(state_path)
         print(f"  episodes chunk: added {result.get('added', {}).get('episodes', 0)}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
-    if state["not_found"]:
-        print(f"not found on Trakt: {len(state['not_found'])} (see push_state.json)")
+    if state.not_found:
+        print(f"not found on Trakt: {len(state.not_found)} (see push_state.json)")
 
 
-async def push_progress(plan: dict, client: TraktClient, dry_run: bool) -> None:
-    state = _load_state()
-    pushed = set(state["pushed"])
-    entries = [
-        e for e in plan["progress"] if f"progress:{_progress_key(e)}" not in pushed
-    ]
-    skipped = len(plan["progress"]) - len(entries)
-    print(f"progress: {len(entries)} items to push, {skipped} already synced")
+async def push_progress(
+    plan: Plan, client: TraktClient, state: PushState, state_path: Path, *, dry_run: bool
+) -> None:
+    entries = [entry for entry in plan.progress if entry not in state]
+    print(f"progress: {len(entries)} items to push, {len(plan.progress) - len(entries)} already synced")
     if dry_run:
         return
 
     for entry in entries:
-        if entry["media"] == "movie":
-            body = {"movie": {"ids": {"imdb": entry["imdb"]}}, "progress": entry["percent"]}
-        else:
-            show, season, number = target(entry)
-            body = {
-                "show": {"ids": show_ids(show)},
-                "episode": {"season": season, "number": number},
-                "progress": entry["percent"],
-            }
-        outcome = await client.scrobble_pause(body)
+        outcome = await client.scrobble_pause(progress_payload(entry))
+        # A rejected pause stored nothing, so it must stay pushable.
         if outcome != "rejected":
-            state["pushed"].append(f"progress:{_progress_key(entry)}")
-            config.save_json(config.STATE_FILE, state)
-        print(f"  {entry['title']} -> {entry['percent']}% ({outcome})")
-        await asyncio.sleep(1)
+            state.record([entry])
+            state.save(state_path)
+        print(f"  {entry.title} -> {entry.percent}% ({outcome})")
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
 
-def _progress_key(entry: dict) -> str:
-    if entry["media"] == "movie":
-        return f"movie:{entry['imdb']}"
-    return f"{entry['imdb']}:{entry['season']}:{entry['episode']}"
-
-
-async def push_watchlist(plan: dict, client: TraktClient, dry_run: bool) -> None:
-    state = _load_state()
-    pushed = set(state["pushed"])
-    entries = [w for w in plan["watchlist"] if f"watchlist:{w['imdb']}" not in pushed]
-    skipped = len(plan["watchlist"]) - len(entries)
-    print(f"watchlist: {len(entries)} shows to push, {skipped} already synced")
+async def push_watchlist(
+    plan: Plan, client: TraktClient, state: PushState, state_path: Path, *, dry_run: bool
+) -> None:
+    entries = [show for show in plan.watchlist if show not in state]
+    print(f"watchlist: {len(entries)} shows to push, {len(plan.watchlist) - len(entries)} already synced")
     if dry_run or not entries:
         return
 
-    body = {"shows": [{"ids": {"imdb": w["imdb"]}} for w in entries]}
-    result = await client.sync_watchlist(body)
-    state["pushed"].extend(f"watchlist:{w['imdb']}" for w in entries)
-    config.save_json(config.STATE_FILE, state)
+    result = await client.add_to_watchlist(
+        {"shows": [{"ids": {"imdb": show.imdb}} for show in entries]}
+    )
+    state.record(entries)
+    state.save(state_path)
     print(f"  added {result.get('added', {}).get('shows', 0)} shows to watchlist")

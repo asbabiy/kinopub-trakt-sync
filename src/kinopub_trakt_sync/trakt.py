@@ -1,18 +1,33 @@
 """Trakt API v2 client: device-code auth, history/watchlist sync, scrobble.
 
 API reference: https://trakt.docs.apiary.io/ (base https://api.trakt.tv).
-GETs run concurrently (bounded); POSTs are serialized at ~1 rps because Trakt
-hard-limits write calls to 1 per second — parallelism there only buys 429s.
+GETs run concurrently; writes are serialized at ~1 rps by the call sites,
+because Trakt hard-limits POST/PUT/DELETE to one per second — parallelism there
+only buys 429s.
 """
 
+from __future__ import annotations
+
 import asyncio
+import logging
 import time
+from http import HTTPStatus
+from types import TracebackType
+from typing import Any, Self
 
 import httpx
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from . import config
+from .settings import TRAKT_API, Settings
+from .storage import read_json, write_secret_json
+
+log = logging.getLogger(__name__)
 
 GET_CONCURRENCY = 8
+PAGE_SIZE = 100
+MAX_RATE_LIMIT_RETRIES = 5
+DEFAULT_RETRY_AFTER = 2
+POLL_TIMEOUT_SECONDS = 600
 
 
 class TraktError(RuntimeError):
@@ -20,146 +35,178 @@ class TraktError(RuntimeError):
 
 
 class TraktClient:
-    def __init__(self) -> None:
-        if not config.TRAKT_CLIENT_ID or not config.TRAKT_CLIENT_SECRET:
-            raise TraktError(
-                "TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET not set. Create an app at "
-                "https://trakt.tv/oauth/applications and put both into .env"
-            )
-        self._http = httpx.AsyncClient(base_url=config.TRAKT_API, timeout=30)
-        self._sem = asyncio.Semaphore(GET_CONCURRENCY)
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._http = httpx.AsyncClient(base_url=TRAKT_API, timeout=30)
+        self._semaphore = asyncio.Semaphore(GET_CONCURRENCY)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self._http.aclose()
 
     # -- auth ------------------------------------------------------------
 
     async def device_auth(self) -> None:
-        resp = await self._http.post("/oauth/device/code", json={"client_id": config.TRAKT_CLIENT_ID})
-        resp.raise_for_status()
-        data = resp.json()
-        print(f"Open {data['verification_url']} and enter code: {data['user_code']}")
-        deadline = time.time() + data.get("expires_in", 600)
-        interval = data.get("interval", 5)
+        response = await self._http.post(
+            "/oauth/device/code", json={"client_id": self._settings.trakt_client_id}
+        )
+        response.raise_for_status()
+        device = response.json()
+        print(f"Open {device['verification_url']} and enter code: {device['user_code']}")
+
+        deadline = time.time() + device.get("expires_in", POLL_TIMEOUT_SECONDS)
+        interval = device.get("interval", 5)
         while time.time() < deadline:
             await asyncio.sleep(interval)
-            resp = await self._http.post(
+            response = await self._http.post(
                 "/oauth/device/token",
                 json={
-                    "code": data["device_code"],
-                    "client_id": config.TRAKT_CLIENT_ID,
-                    "client_secret": config.TRAKT_CLIENT_SECRET,
+                    "code": device["device_code"],
+                    "client_id": self._settings.trakt_client_id,
+                    "client_secret": self._settings.trakt_client_secret,
                 },
             )
-            if resp.status_code == 200:
-                self._store(resp.json())
+            if response.status_code == HTTPStatus.OK:
+                self._store_tokens(response.json())
                 print("trakt: authorized")
                 return
-            if resp.status_code == 429:
+            if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                 interval += 1
-                continue
-            if resp.status_code != 400:  # 400 = authorization pending
-                raise TraktError(f"device auth failed: {resp.status_code} {resp.text}")
+            elif response.status_code != HTTPStatus.BAD_REQUEST:  # 400 = still pending
+                raise TraktError(f"device auth failed: {response.status_code} {response.text}")
         raise TraktError("device code expired, run auth again")
 
-    def _store(self, payload: dict) -> None:
-        tokens = config.load_tokens()
-        payload["obtained_at"] = int(time.time())
-        tokens["trakt"] = payload
-        config.save_tokens(tokens)
+    def _store_tokens(self, payload: dict[str, Any]) -> None:
+        tokens = read_json(self._settings.paths.tokens, default={})
+        tokens["trakt"] = {**payload, "obtained_at": int(time.time())}
+        write_secret_json(self._settings.paths.tokens, tokens)
 
     async def _access_token(self) -> str:
-        tokens = config.load_tokens().get("trakt")
+        tokens = read_json(self._settings.paths.tokens, default={}).get("trakt")
         if not tokens:
             raise TraktError("not authorized, run: kts auth trakt")
-        if time.time() > tokens["obtained_at"] + tokens.get("expires_in", 86400) - 300:
-            resp = await self._http.post(
-                "/oauth/token",
-                json={
-                    "grant_type": "refresh_token",
-                    "refresh_token": tokens["refresh_token"],
-                    "client_id": config.TRAKT_CLIENT_ID,
-                    "client_secret": config.TRAKT_CLIENT_SECRET,
-                    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-                },
-            )
-            if resp.status_code != 200:
-                raise TraktError(f"token refresh failed ({resp.status_code}), run: kts auth trakt")
-            self._store(resp.json())
-            tokens = config.load_tokens()["trakt"]
-        return tokens["access_token"]
+        if time.time() <= tokens["obtained_at"] + tokens.get("expires_in", 86400) - 300:
+            return tokens["access_token"]
 
-    # -- requests --------------------------------------------------------
+        response = await self._http.post(
+            "/oauth/token",
+            json={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "client_id": self._settings.trakt_client_id,
+                "client_secret": self._settings.trakt_client_secret,
+                "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            },
+        )
+        if response.status_code != HTTPStatus.OK:
+            raise TraktError(f"token refresh failed ({response.status_code}), run: kts auth trakt")
+        self._store_tokens(response.json())
+        return read_json(self._settings.paths.tokens)["trakt"]["access_token"]
 
-    async def _request(
-        self, method: str, path: str, json_body: dict | None = None, params: dict | None = None
+    # -- transport -------------------------------------------------------
+
+    @retry(
+        retry=retry_if_exception_type(httpx.TransportError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        reraise=True,
+    )
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> httpx.Response:
+        """Transport failures are retried with backoff; throttling is not —
+        Trakt states the exact delay in Retry-After, which beats guessing."""
         headers = {
             "trakt-api-version": "2",
-            "trakt-api-key": config.TRAKT_CLIENT_ID,
+            "trakt-api-key": self._settings.trakt_client_id,
             "Authorization": f"Bearer {await self._access_token()}",
         }
-        for _ in range(5):
-            async with self._sem:
-                resp = await self._http.request(
+        for _ in range(MAX_RATE_LIMIT_RETRIES):
+            async with self._semaphore:
+                response = await self._http.request(
                     method, path, json=json_body, params=params, headers=headers
                 )
-            if resp.status_code == 429:
-                await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
-                continue
-            return resp
+            if response.status_code != HTTPStatus.TOO_MANY_REQUESTS:
+                return response
+            delay = int(response.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
+            log.debug("trakt throttled %s, waiting %ss", path, delay)
+            await asyncio.sleep(delay)
         raise TraktError(f"rate limited repeatedly on {path}")
 
-    async def get_json(self, path: str, **params):
-        """GET returning parsed JSON, or None on 404."""
-        resp = await self._request("GET", path, params=params or None)
-        if resp.status_code == 404:
+    async def get_json(self, path: str, **params: Any) -> Any:
+        """Parsed JSON, or None when Trakt does not know the resource."""
+        response = await self.request("GET", path, params=params or None)
+        if response.status_code == HTTPStatus.NOT_FOUND:
             return None
-        resp.raise_for_status()
-        return resp.json()
+        response.raise_for_status()
+        return response.json()
 
-    async def paginated(self, path: str, **params) -> list:
-        """All pages; the first page reveals the page count, the rest fetch
-        concurrently."""
-        first = await self._request("GET", path, params={**params, "page": 1, "limit": 100})
+    async def paginated(self, path: str, **params: Any) -> list[dict[str, Any]]:
+        """All pages: the first response reveals the page count, the rest are
+        fetched concurrently."""
+        first = await self.request("GET", path, params={**params, "page": 1, "limit": PAGE_SIZE})
         first.raise_for_status()
-        rows = first.json()
-        pages = int(first.headers.get("x-pagination-page-count") or 1)
-        if pages > 1:
-            results = await asyncio.gather(
+        rows: list[dict[str, Any]] = list(first.json())
+        page_count = int(first.headers.get("x-pagination-page-count") or 1)
+        if page_count > 1:
+            responses = await asyncio.gather(
                 *[
-                    self._request("GET", path, params={**params, "page": p, "limit": 100})
-                    for p in range(2, pages + 1)
+                    self.request("GET", path, params={**params, "page": page, "limit": PAGE_SIZE})
+                    for page in range(2, page_count + 1)
                 ]
             )
-            for resp in results:
-                resp.raise_for_status()
-                rows.extend(resp.json())
+            for response in responses:
+                response.raise_for_status()
+                rows.extend(response.json())
         return rows
 
-    async def watched(self, media: str) -> list:
-        resp = await self._request("GET", f"/sync/watched/{media}")
-        resp.raise_for_status()
-        return resp.json()
+    # -- sync ------------------------------------------------------------
 
-    async def sync_history(self, body: dict) -> dict:
-        resp = await self._request("POST", "/sync/history", body)
-        resp.raise_for_status()
-        return resp.json()
+    async def watched(self, media: str) -> list[dict[str, Any]]:
+        response = await self.request("GET", f"/sync/watched/{media}")
+        response.raise_for_status()
+        return response.json()
 
-    async def history_remove(self, event_ids: list) -> dict:
-        resp = await self._request("POST", "/sync/history/remove", {"ids": event_ids})
-        resp.raise_for_status()
-        return resp.json()
+    async def playback(self) -> list[dict[str, Any]]:
+        return await self.get_json("/sync/playback") or []
 
-    async def sync_watchlist(self, body: dict) -> dict:
-        resp = await self._request("POST", "/sync/watchlist", body)
-        resp.raise_for_status()
-        return resp.json()
+    async def add_to_history(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = await self.request("POST", "/sync/history", json_body=body)
+        response.raise_for_status()
+        return response.json()
 
-    async def scrobble_pause(self, body: dict) -> str:
-        """Saves playback progress. Returns outcome: ok | duplicate | rejected."""
-        resp = await self._request("POST", "/scrobble/pause", body)
-        if resp.status_code == 409:
+    async def remove_from_history(self, event_ids: list[int]) -> dict[str, Any]:
+        response = await self.request("POST", "/sync/history/remove", json_body={"ids": event_ids})
+        response.raise_for_status()
+        return response.json()
+
+    async def add_to_watchlist(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = await self.request("POST", "/sync/watchlist", json_body=body)
+        response.raise_for_status()
+        return response.json()
+
+    async def scrobble_pause(self, body: dict[str, Any]) -> str:
+        """Store playback progress. Returns ok | duplicate | rejected.
+
+        Trakt ignores a pause below 1% and at or above its 80% "finished"
+        threshold, so `rejected` is an expected, non-fatal outcome.
+        """
+        response = await self.request("POST", "/scrobble/pause", json_body=body)
+        if response.status_code == HTTPStatus.CONFLICT:
             return "duplicate"
-        if resp.status_code == 422:
+        if response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY:
             return "rejected"
-        resp.raise_for_status()
+        response.raise_for_status()
         return "ok"

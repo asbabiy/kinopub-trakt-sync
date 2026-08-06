@@ -1,201 +1,292 @@
 """Element-wise verification of the Trakt account against the sync plan.
 
-Compares every planned movie/episode play (identity AND watched_at timestamp)
-and every playback-progress entry with what the account actually holds, then
-reports missing / extra / timestamp-mismatched items. With fix=True it removes
-wrong history events (they are this tool's own artifacts — the source dump
-stays untouched) and pushes the correct ones.
+Compares every planned play (identity and watched_at) and every playback
+percent with what the account actually holds, then reports missing, extra and
+mismatched entries. With `fix` it removes the wrong history events — they are
+this tool's own artifacts, the kino.pub source is never touched — and pushes
+the correct ones.
 """
 
-import asyncio
+from __future__ import annotations
 
-from . import config
-from .push import episode_key, history_payload, show_ids, target as _target
+import asyncio
+import logging
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from .models import EpisodeWatch, MovieWatch, Plan, Progress, ShowRef
+from .push import PushState, history_payload, progress_payload
 from .trakt import TraktClient
 
+log = logging.getLogger(__name__)
 
-def _same_watched_at(expected: str, actual: str) -> bool:
-    # Trakt stores watched_at with minute precision (seconds are zeroed),
-    # so timestamps are compared truncated to the minute.
+PERCENT_TOLERANCE = 0.1
+REPORT_PREVIEW = 10
+WRITE_INTERVAL_SECONDS = 1
+
+
+class HistoryEvent(BaseModel):
+    id: int
+    watched_at: str
+
+
+class TimestampMismatch(BaseModel):
+    title: str
+    expected: str
+    actual: str
+    event_id: int
+    season: int | None = None
+    episode: int | None = None
+
+
+class ProgressMismatch(BaseModel):
+    title: str
+    expected: float
+    actual: float
+
+
+class ExtraEvent(BaseModel):
+    key: str
+    event_id: int
+
+
+class VerifyReport(BaseModel):
+    missing_movies: list[MovieWatch] = []
+    missing_episodes: list[EpisodeWatch] = []
+    timestamp_mismatches: list[TimestampMismatch] = []
+    extra_events: list[ExtraEvent] = []
+    progress_missing: list[Progress] = []
+    progress_mismatches: list[ProgressMismatch] = []
+    verified_movies: int = 0
+    verified_episodes: int = 0
+    verified_progress: int = 0
+
+    @property
+    def problem_count(self) -> int:
+        return (
+            len(self.missing_movies)
+            + len(self.missing_episodes)
+            + len(self.timestamp_mismatches)
+            + len(self.extra_events)
+            + len(self.progress_missing)
+            + len(self.progress_mismatches)
+        )
+
+
+def same_moment(expected: str, actual: str) -> bool:
+    """Trakt stores watched_at with minute precision (seconds are zeroed), so
+    timestamps are compared truncated to the minute."""
     return expected == "unknown" or expected[:16] == (actual or "")[:16]
 
 
-async def _actual_history(client: TraktClient):
-    """Index history events by every id the row exposes (imdb and trakt)."""
-    movies: dict = {}
-    for row in await client.paginated("/sync/history/movies"):
+async def _actual_history(
+    client: TraktClient,
+) -> tuple[dict[ShowRef, list[HistoryEvent]], dict[tuple[ShowRef, int, int], list[HistoryEvent]]]:
+    movie_rows, episode_rows = await asyncio.gather(
+        client.paginated("/sync/history/movies"), client.paginated("/sync/history/episodes")
+    )
+
+    movies: dict[ShowRef, list[HistoryEvent]] = {}
+    for row in movie_rows:
+        event = HistoryEvent.model_validate(row)
         ids = row["movie"]["ids"]
-        event = {"id": row["id"], "watched_at": row["watched_at"]}
         for ref in (ids.get("imdb"), ids.get("trakt")):
             if ref:
                 movies.setdefault(ref, []).append(event)
-    episodes: dict = {}
-    for row in await client.paginated("/sync/history/episodes"):
+
+    episodes: dict[tuple[ShowRef, int, int], list[HistoryEvent]] = {}
+    for row in episode_rows:
+        event = HistoryEvent.model_validate(row)
         ids = row["show"]["ids"]
-        ep = row["episode"]
-        event = {"id": row["id"], "watched_at": row["watched_at"]}
+        episode = row["episode"]
         for ref in (ids.get("imdb"), ids.get("trakt")):
             if ref:
-                episodes.setdefault((ref, ep["season"], ep["number"]), []).append(event)
+                key = (ref, episode["season"], episode["number"])
+                episodes.setdefault(key, []).append(event)
     return movies, episodes
 
 
-async def _actual_playback(client: TraktClient) -> dict:
-    playback = {}
-    for row in await client.get_json("/sync/playback") or []:
+async def _actual_playback(client: TraktClient) -> dict[Any, float]:
+    playback: dict[Any, float] = {}
+    for row in await client.playback():
         if row["type"] == "movie":
-            for ref in (row["movie"]["ids"].get("imdb"), row["movie"]["ids"].get("trakt")):
+            ids = row["movie"]["ids"]
+            for ref in (ids.get("imdb"), ids.get("trakt")):
                 if ref:
                     playback[ref] = row["progress"]
         else:
             ids = row["show"]["ids"]
-            ep = row["episode"]
+            episode = row["episode"]
             for ref in (ids.get("imdb"), ids.get("trakt")):
                 if ref:
-                    playback[(ref, ep["season"], ep["number"])] = row["progress"]
+                    playback[ref, episode["season"], episode["number"]] = row["progress"]
     return playback
 
 
-async def build_report(plan: dict, client: TraktClient) -> dict:
-    movies_actual, episodes_actual = await _actual_history(client)
-    playback = await _actual_playback(client)
+def _check_history(
+    plan: Plan,
+    movies_actual: dict[ShowRef, list[HistoryEvent]],
+    episodes_actual: dict[tuple[ShowRef, int, int], list[HistoryEvent]],
+    report: VerifyReport,
+) -> set[int]:
+    """Match planned plays against the account; returns the claimed event ids."""
+    claimed: set[int] = set()
 
-    report = {
-        "missing_movies": [],
-        "missing_episodes": [],
-        "ts_mismatch": [],
-        "extra_events": [],
-        "progress_missing": [],
-        "progress_mismatch": [],
-        "ok": {"movies": 0, "episodes": 0, "progress": 0},
-    }
-
-    claimed_event_ids = set()
-    for m in plan["movies_watched"]:
-        events = movies_actual.get(m["imdb"], [])
+    for movie in plan.movies:
+        events = movies_actual.get(movie.imdb)
         if not events:
-            report["missing_movies"].append(m)
+            report.missing_movies.append(movie)
             continue
-        event = events[0]
-        claimed_event_ids.add(event["id"])
-        if not _same_watched_at(m["watched_at"], event["watched_at"]):
-            report["ts_mismatch"].append(
-                {**m, "actual": event["watched_at"], "event_id": event["id"]}
-            )
+        claimed.add(events[0].id)
+        if same_moment(movie.watched_at, events[0].watched_at):
+            report.verified_movies += 1
         else:
-            report["ok"]["movies"] += 1
+            report.timestamp_mismatches.append(
+                TimestampMismatch(
+                    title=movie.title,
+                    expected=movie.watched_at,
+                    actual=events[0].watched_at,
+                    event_id=events[0].id,
+                )
+            )
 
-    for e in plan["episodes_watched"]:
-        events = episodes_actual.get(_target(e), [])
+    for episode in plan.episodes:
+        events = episodes_actual.get(episode.trakt.key)
         if not events:
-            report["missing_episodes"].append(e)
+            report.missing_episodes.append(episode)
             continue
-        event = events[0]
-        claimed_event_ids.add(event["id"])
-        if not _same_watched_at(e["watched_at"], event["watched_at"]):
-            report["ts_mismatch"].append(
-                {**e, "actual": event["watched_at"], "event_id": event["id"]}
-            )
+        claimed.add(events[0].id)
+        if same_moment(episode.watched_at, events[0].watched_at):
+            report.verified_episodes += 1
         else:
-            report["ok"]["episodes"] += 1
+            report.timestamp_mismatches.append(
+                TimestampMismatch(
+                    title=episode.title,
+                    expected=episode.watched_at,
+                    actual=events[0].watched_at,
+                    event_id=events[0].id,
+                    season=episode.season,
+                    episode=episode.episode,
+                )
+            )
+    return claimed
 
-    # Any history event not claimed by the plan is an artifact of a bad push
-    # (e.g. episodes recorded under shifted identities before reconciliation).
-    seen = set()
-    for key, events in list(movies_actual.items()) + list(episodes_actual.items()):
-        for event in events:
-            if event["id"] not in claimed_event_ids and event["id"] not in seen:
-                seen.add(event["id"])
-                report["extra_events"].append({"key": str(key), "event_id": event["id"]})
 
-    for p in plan["progress"]:
-        key = _target(p) if p["media"] == "episode" else p["imdb"]
-        actual = playback.get(key)
+def _check_progress(plan: Plan, playback: dict[Any, float], report: VerifyReport) -> None:
+    for entry in plan.progress:
+        target = entry.trakt
+        actual = playback.get(target.key if target else entry.imdb)
         if actual is None:
-            report["progress_missing"].append(p)
-        elif abs(actual - p["percent"]) > 0.1:
-            report["progress_mismatch"].append({**p, "actual": actual})
+            report.progress_missing.append(entry)
+        elif abs(actual - entry.percent) > PERCENT_TOLERANCE:
+            report.progress_mismatches.append(
+                ProgressMismatch(title=entry.title, expected=entry.percent, actual=actual)
+            )
         else:
-            report["ok"]["progress"] += 1
+            report.verified_progress += 1
 
+
+async def build_report(plan: Plan, client: TraktClient) -> VerifyReport:
+    (movies_actual, episodes_actual), playback = await asyncio.gather(
+        _actual_history(client), _actual_playback(client)
+    )
+    report = VerifyReport()
+    claimed = _check_history(plan, movies_actual, episodes_actual, report)
+
+    # A history event that no plan entry claims is residue of an earlier bad
+    # push — episodes recorded under shifted identities before reconciliation
+    # existed, for instance.
+    seen: set[int] = set()
+    for key, events in (*movies_actual.items(), *episodes_actual.items()):
+        for event in events:
+            if event.id not in claimed and event.id not in seen:
+                seen.add(event.id)
+                report.extra_events.append(ExtraEvent(key=str(key), event_id=event.id))
+
+    _check_progress(plan, playback, report)
     return report
 
 
-async def apply_fixes(plan: dict, report: dict, client: TraktClient) -> None:
-    remove_ids = [x["event_id"] for x in report["extra_events"]] + [
-        x["event_id"] for x in report["ts_mismatch"]
+async def apply_fixes(
+    plan: Plan, report: VerifyReport, client: TraktClient, state_path: Path
+) -> None:
+    wrong_events = [event.event_id for event in report.extra_events] + [
+        mismatch.event_id for mismatch in report.timestamp_mismatches
     ]
-    if remove_ids:
-        deleted = (await client.history_remove(remove_ids)).get("deleted", {})
+    if wrong_events:
+        deleted = (await client.remove_from_history(wrong_events)).get("deleted", {})
         print(f"removed wrong events: {deleted}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
-    movies = report["missing_movies"] + [
-        x for x in report["ts_mismatch"] if "season" not in x
+    mismatched = {(m.title, m.season, m.episode) for m in report.timestamp_mismatches}
+    movies = report.missing_movies + [
+        movie for movie in plan.movies if (movie.title, None, None) in mismatched
     ]
-    episodes = report["missing_episodes"] + [
-        x for x in report["ts_mismatch"] if "season" in x
+    episodes = report.missing_episodes + [
+        episode
+        for episode in plan.episodes
+        if (episode.title, episode.season, episode.episode) in mismatched
     ]
     if movies or episodes:
-        result = await client.sync_history(history_payload(movies, episodes))
+        result = await client.add_to_history(history_payload(movies, episodes))
         print(f"pushed: {result.get('added')}  not_found: {result.get('not_found')}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
-    for p in report["progress_missing"] + report["progress_mismatch"]:
-        if p["media"] == "movie":
-            body = {"movie": {"ids": {"imdb": p["imdb"]}}, "progress": p["percent"]}
-        else:
-            show, season, number = _target(p)
-            body = {
-                "show": {"ids": show_ids(show)},
-                "episode": {"season": season, "number": number},
-                "progress": p["percent"],
-            }
-        outcome = await client.scrobble_pause(body)
-        print(f"  progress {p['title']} -> {p['percent']}% ({outcome})")
-        await asyncio.sleep(1)
+    stale = {mismatch.title for mismatch in report.progress_mismatches}
+    for entry in report.progress_missing + [p for p in plan.progress if p.title in stale]:
+        outcome = await client.scrobble_pause(progress_payload(entry))
+        print(f"  progress {entry.title} -> {entry.percent}% ({outcome})")
+        await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
-    # The account now reflects the plan: make the push state match it.
-    state = {"pushed": [], "not_found": []}
-    if config.STATE_FILE.exists():
-        state["not_found"] = config.load_json(config.STATE_FILE).get("not_found", [])
-    state["pushed"] = (
-        [f"movie:{m['imdb']}" for m in plan["movies_watched"]]
-        + [episode_key(e) for e in plan["episodes_watched"]]
-        + [
-            f"progress:{p['imdb'] if p['media'] == 'movie' else ':'.join(map(str, (p['imdb'], p['season'], p['episode'])))}"
-            for p in plan["progress"]
-        ]
-        + [f"watchlist:{w['imdb']}" for w in plan["watchlist"]]
-    )
-    config.save_json(config.STATE_FILE, state)
+    # The account now reflects the plan, so the local state must say the same.
+    state = PushState()
+    state.record([*plan.movies, *plan.episodes, *plan.progress, *plan.watchlist])
+    state.save(state_path)
 
 
-def print_report(report: dict) -> None:
-    ok = report["ok"]
-    print(f"verified ok: {ok['movies']} movies, {ok['episodes']} episodes, {ok['progress']} progress")
-    for key in (
-        "missing_movies",
-        "missing_episodes",
-        "ts_mismatch",
-        "extra_events",
-        "progress_missing",
-        "progress_mismatch",
-    ):
-        rows = report[key]
+def format_report(report: VerifyReport) -> str:
+    lines = [
+        f"verified ok: {report.verified_movies} movies, "
+        f"{report.verified_episodes} episodes, {report.verified_progress} progress"
+    ]
+    sections: list[tuple[str, Sequence[ReportRow]]] = [
+        ("missing movies", report.missing_movies),
+        ("missing episodes", report.missing_episodes),
+        ("timestamp mismatches", report.timestamp_mismatches),
+        ("extra events", report.extra_events),
+        ("progress missing", report.progress_missing),
+        ("progress mismatches", report.progress_mismatches),
+    ]
+    for name, rows in sections:
         if not rows:
             continue
-        print(f"{key}: {len(rows)}")
-        for row in rows[:10]:
-            label = row.get("title") or row.get("key")
-            extra = ""
-            if "season" in row:
-                extra = f" s{row['season']}e{row['episode']}"
-                if row.get("target"):
-                    t = row["target"]
-                    extra += f" -> {t['show']} s{t['season']}e{t['episode']}"
-            if "actual" in row:
-                extra += f" (expected {row.get('watched_at') or row.get('percent')}, actual {row['actual']})"
-            print(f"  - {label}{extra}")
-        if len(rows) > 10:
-            print(f"  ... and {len(rows) - 10} more")
+        lines.append(f"{name}: {len(rows)}")
+        for row in rows[:REPORT_PREVIEW]:
+            lines.append(f"  - {_describe(row)}")
+        if len(rows) > REPORT_PREVIEW:
+            lines.append(f"  ... and {len(rows) - REPORT_PREVIEW} more")
+    return "\n".join(lines)
+
+
+type ReportRow = (
+    MovieWatch | EpisodeWatch | Progress | TimestampMismatch | ProgressMismatch | ExtraEvent
+)
+
+
+def _describe(row: ReportRow) -> str:
+    if isinstance(row, ExtraEvent):
+        return f"{row.key} (event {row.event_id})"
+    if isinstance(row, TimestampMismatch):
+        where = f" s{row.season}e{row.episode}" if row.season is not None else ""
+        return f"{row.title}{where}: expected {row.expected}, actual {row.actual}"
+    if isinstance(row, ProgressMismatch):
+        return f"{row.title}: expected {row.expected}%, actual {row.actual}%"
+    if isinstance(row, EpisodeWatch):
+        target = row.trakt
+        return f"{row.title} s{row.season}e{row.episode} -> {target.show} s{target.season}e{target.episode}"
+    if isinstance(row, Progress) and row.is_episode:
+        return f"{row.title} s{row.season}e{row.episode} ({row.percent}%)"
+    return f"{row.title}"

@@ -1,125 +1,184 @@
-"""Convert a kino.pub dump into a Trakt sync plan.
+"""Turn a kino.pub dump into a sync plan.
 
-Matching is by IMDb id (kino.pub stores it as a bare integer). Items without
-an IMDb id land in the "unmatched" bucket for manual review — Trakt cannot
-reliably match them otherwise.
+Matching starts from the IMDb id, which kino.pub stores for nearly every item
+as a bare integer. Items without one land in `unmatched` for manual review:
+Trakt cannot match them reliably, and guessing would fabricate history.
 """
 
-from datetime import datetime, timezone
+from __future__ import annotations
 
-MOVIE_TYPES = {"movie", "documovie", "3d", "concert"}
+from datetime import UTC, datetime
 
-# kino.pub episode/video status: -1 unwatched, 0 in progress, 1 watched.
-WATCHED = 1
+from .models import (
+    WATCHED,
+    Dump,
+    EpisodeWatch,
+    KinopubItem,
+    KinopubVideo,
+    KinopubWatching,
+    MovieWatch,
+    Plan,
+    Progress,
+    Unmatched,
+    WatchlistShow,
+)
+
+MOVIE_TYPES = frozenset({"movie", "documovie", "3d", "concert"})
+
+# Trakt ignores a pause below 1% and treats 80% as finished, so an unfinished
+# item has to stay strictly inside that band to be recorded as in-progress.
+MIN_PERCENT = 1.0
+MAX_PERCENT = 79.9
+
+WATCHED_AT_UNKNOWN = "unknown"
 
 
-def imdb_id(item: dict) -> str | None:
-    raw = item.get("imdb")
-    if not raw:
+def imdb_id(item: KinopubItem) -> str | None:
+    """kino.pub stores the imdb id as an integer, without the tt prefix."""
+    if not item.imdb:
         return None
-    digits = str(raw).removeprefix("tt")
+    digits = str(item.imdb).removeprefix("tt")
     if not digits.isdigit() or int(digits) == 0:
         return None
     return f"tt{int(digits):07d}"
 
 
-def iso(ts) -> str:
-    # Trakt accepts the literal "unknown" to mark a watch without a date.
-    if not ts:
-        return "unknown"
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+def watched_at(timestamp: int | None) -> str:
+    """UTC datetime for Trakt, or the literal "unknown" when kino.pub has no
+    timestamp — Trakt then marks the item watched without a date."""
+    if not timestamp:
+        return WATCHED_AT_UNKNOWN
+    return datetime.fromtimestamp(timestamp, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def _percent(time_watched: int, duration: int) -> float | None:
-    if not duration or not time_watched:
+def playback_percent(position: int, duration: int) -> float | None:
+    """Percentage Trakt will accept for a pause, or None if out of band."""
+    if not duration or not position:
         return None
-    # Trakt rejects a pause below 1% and at >=80% (its "finished" threshold),
-    # so unfinished items cap at 79.9 to stay recorded as in-progress.
-    percent = round(min(time_watched / duration * 100, 79.9), 1)
-    return percent if percent >= 1 else None
+    percent = round(min(position / duration * 100, MAX_PERCENT), 1)
+    return percent if percent >= MIN_PERCENT else None
 
 
-def _plan_movie(plan: dict, base: dict, watching: dict) -> None:
-    videos = watching.get("videos") or []
-    if videos and all(v.get("status") == WATCHED for v in videos):
-        watched_at = iso(max(v.get("updated") or 0 for v in videos))
-        plan["movies_watched"].append({**base, "watched_at": watched_at})
-        return
-    percent = _percent(
-        sum(v.get("time") or 0 for v in videos),
-        sum(v.get("duration") or 0 for v in videos),
+def _movie_entries(
+    item: KinopubItem, imdb: str, watching: KinopubWatching | None
+) -> tuple[MovieWatch | None, Progress | None]:
+    videos: list[KinopubVideo] = watching.videos if watching else []
+
+    if videos and all(video.status == WATCHED for video in videos):
+        movie = MovieWatch(
+            kinopub_id=item.id,
+            title=item.title,
+            year=item.year,
+            imdb=imdb,
+            watched_at=watched_at(max(video.updated or 0 for video in videos)),
+        )
+        return movie, None
+
+    percent = playback_percent(
+        sum(video.time or 0 for video in videos),
+        sum(video.duration or 0 for video in videos),
     )
-    if percent is not None:
-        plan["progress"].append({**base, "media": "movie", "percent": percent})
+    if percent is None:
+        return None, None
+    progress = Progress(
+        kinopub_id=item.id, title=item.title, year=item.year, imdb=imdb, percent=percent
+    )
+    return None, progress
 
 
-def _plan_show(plan: dict, base: dict, watching: dict) -> None:
-    for season in watching.get("seasons") or []:
-        for ep in season.get("episodes") or []:
-            entry = {**base, "season": season.get("number"), "episode": ep.get("number")}
-            if ep.get("status") == WATCHED:
-                plan["episodes_watched"].append({**entry, "watched_at": iso(ep.get("updated"))})
+def _show_entries(
+    item: KinopubItem, imdb: str, watching: KinopubWatching | None
+) -> tuple[list[EpisodeWatch], list[Progress]]:
+    watched: list[EpisodeWatch] = []
+    progress: list[Progress] = []
+
+    for season in watching.seasons if watching else []:
+        for episode in season.episodes:
+            if episode.status == WATCHED:
+                watched.append(
+                    EpisodeWatch(
+                        kinopub_id=item.id,
+                        title=item.title,
+                        year=item.year,
+                        imdb=imdb,
+                        season=season.number,
+                        episode=episode.number,
+                        watched_at=watched_at(episode.updated),
+                    )
+                )
                 continue
-            percent = _percent(ep.get("time") or 0, ep.get("duration") or 0)
+            percent = playback_percent(episode.time or 0, episode.duration or 0)
             if percent is not None:
-                plan["progress"].append({**entry, "media": "episode", "percent": percent})
+                progress.append(
+                    Progress(
+                        kinopub_id=item.id,
+                        title=item.title,
+                        year=item.year,
+                        imdb=imdb,
+                        season=season.number,
+                        episode=episode.number,
+                        percent=percent,
+                    )
+                )
+    return watched, progress
 
 
-def build_plan(dump: dict) -> dict:
-    plan: dict = {
-        "movies_watched": [],
-        "episodes_watched": [],
-        "progress": [],
-        "watchlist": [],
-        "unmatched": [],
-    }
+def build_plan(dump: Dump) -> Plan:
+    plan = Plan()
 
-    for item_id, item in dump.get("items", {}).items():
-        base = {
-            "kinopub_id": int(item_id),
-            "title": item.get("title"),
-            "year": item.get("year"),
-            "type": item.get("type"),
-        }
+    for item_id, item in dump.items.items():
         imdb = imdb_id(item)
-        if not imdb:
-            plan["unmatched"].append({**base, "reason": "no imdb id"})
+        if imdb is None:
+            plan.unmatched.append(
+                Unmatched(
+                    title=item.title, reason="no imdb id", kinopub_id=item.id, year=item.year
+                )
+            )
             continue
-        base["imdb"] = imdb
-        watching = dump.get("watching", {}).get(item_id) or {}
-        if item.get("type") in MOVIE_TYPES:
-            _plan_movie(plan, base, watching)
+        watching = dump.watching.get(item_id)
+        if item.type in MOVIE_TYPES:
+            movie, movie_progress = _movie_entries(item, imdb, watching)
+            if movie:
+                plan.movies.append(movie)
+            if movie_progress:
+                plan.progress.append(movie_progress)
         else:
-            _plan_show(plan, base, watching)
+            episodes, episode_progress = _show_entries(item, imdb, watching)
+            plan.episodes.extend(episodes)
+            plan.progress.extend(episode_progress)
 
-    for record in dump.get("watchlist") or []:
-        item = dump.get("items", {}).get(str(record.get("id"))) or record
-        entry = {"kinopub_id": record.get("id"), "title": item.get("title"), "year": item.get("year")}
+    for entry in dump.watchlist:
+        item = dump.items.get(str(entry.id)) or KinopubItem(
+            id=entry.id, title=entry.title, year=entry.year
+        )
         imdb = imdb_id(item)
-        if imdb:
-            plan["watchlist"].append({**entry, "imdb": imdb})
-        else:
-            plan["unmatched"].append({**entry, "reason": "watchlist: no imdb id"})
+        if imdb is None:
+            plan.unmatched.append(
+                Unmatched(
+                    title=item.title,
+                    reason="watchlist: no imdb id",
+                    kinopub_id=entry.id,
+                    year=item.year,
+                )
+            )
+            continue
+        plan.watchlist.append(
+            WatchlistShow(kinopub_id=entry.id, title=item.title, year=item.year, imdb=imdb)
+        )
 
-    plan["stats"] = {
-        "movies_watched": len(plan["movies_watched"]),
-        "episodes_watched": len(plan["episodes_watched"]),
-        "progress": len(plan["progress"]),
-        "watchlist": len(plan["watchlist"]),
-        "unmatched": len(plan["unmatched"]),
-    }
     return plan
 
 
-def print_summary(plan: dict) -> None:
-    stats = plan["stats"]
-    shows = {e["imdb"] for e in plan["episodes_watched"]}
-    print(f"movies watched:   {stats['movies_watched']}")
-    print(f"episodes watched: {stats['episodes_watched']} across {len(shows)} shows")
-    print(f"in progress:      {stats['progress']}")
-    print(f"watchlist:        {stats['watchlist']}")
-    print(f"unmatched:        {stats['unmatched']}")
-    for entry in plan["unmatched"][:15]:
-        print(f"  - {entry.get('title')} ({entry.get('year')}): {entry.get('reason')}")
-    if stats["unmatched"] > 15:
-        print(f"  ... and {stats['unmatched'] - 15} more (see sync_plan.json)")
+def format_summary(plan: Plan, unmatched_preview: int = 15) -> str:
+    stats = plan.stats
+    lines = [
+        f"movies watched:   {stats.movies}",
+        f"episodes watched: {stats.episodes} across {stats.shows} shows",
+        f"in progress:      {stats.progress}",
+        f"watchlist:        {stats.watchlist}",
+        f"unmatched:        {stats.unmatched}",
+    ]
+    lines += [f"  - {entry.title} ({entry.year}): {entry.reason}" for entry in plan.unmatched[:unmatched_preview]]
+    if stats.unmatched > unmatched_preview:
+        lines.append(f"  ... and {stats.unmatched - unmatched_preview} more (see sync_plan.json)")
+    return "\n".join(lines)

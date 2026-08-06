@@ -1,109 +1,164 @@
-import argparse
-import asyncio
-import sys
+"""Command line interface: auth -> pull -> plan -> push -> verify."""
 
-from . import config, push, transform, verify
+from __future__ import annotations
+
+import asyncio
+import logging
+from enum import StrEnum
+from typing import Annotated
+
+import typer
+
+from . import transform, verify
 from .gemini import Gemini
 from .kinopub import KinopubClient
+from .models import Dump, Plan
 from .pull import pull
-from .reconcile import Catalog, reconcile_plan
+from .push import PushState, push_history, push_progress, push_watchlist
+from .reconcile import Catalog, DecisionCache, reconcile_plan
+from .settings import Settings
+from .storage import read_json, read_model, write_json, write_model
 from .trakt import TraktClient
 
-
-async def _plan() -> None:
-    if not config.DUMP_FILE.exists():
-        sys.exit("no dump found, run: kts pull")
-    dump = config.load_json(config.DUMP_FILE)
-    plan = transform.build_plan(dump)
-    cache = config.load_json(config.TRAKT_CACHE_FILE) if config.TRAKT_CACHE_FILE.exists() else {}
-    catalog = Catalog(TraktClient(), cache)
-    plan = await reconcile_plan(plan, dump, catalog, Gemini())
-    config.save_json(config.TRAKT_CACHE_FILE, cache)
-    for note in plan.get("reconcile_notes", []):
-        print(f"reconcile: {note}")
-    config.save_json(config.PLAN_FILE, plan)
-    transform.print_summary(plan)
-    print(f"plan saved: {config.PLAN_FILE}")
+app = typer.Typer(
+    help="One-way sync of kino.pub watch data to Trakt.", no_args_is_help=True, add_completion=False
+)
 
 
-async def _push(args) -> None:
-    if not (args.history or args.progress or args.watchlist or args.all):
-        sys.exit("nothing selected: use --history / --progress / --watchlist / --all")
-    if not config.PLAN_FILE.exists():
-        sys.exit("no plan found, run: kts plan")
-    plan = config.load_json(config.PLAN_FILE)
-    client = TraktClient()
-    if args.history or args.all:
-        await push.push_history(plan, client, args.dry_run)
-    if args.progress or args.all:
-        await push.push_progress(plan, client, args.dry_run)
-    if args.watchlist or args.all:
-        await push.push_watchlist(plan, client, args.dry_run)
+class Service(StrEnum):
+    KINOPUB = "kinopub"
+    TRAKT = "trakt"
 
 
-async def _verify(args) -> None:
-    if not config.PLAN_FILE.exists():
-        sys.exit("no plan found, run: kts plan")
-    plan = config.load_json(config.PLAN_FILE)
-    client = TraktClient()
-    report = await verify.build_report(plan, client)
-    verify.print_report(report)
-    config.save_json(config.VERIFY_REPORT_FILE, report)
-    problems = sum(
-        len(report[k])
-        for k in (
-            "missing_movies",
-            "missing_episodes",
-            "ts_mismatch",
-            "extra_events",
-            "progress_missing",
-            "progress_mismatch",
-        )
+def _settings() -> Settings:
+    return Settings()
+
+
+def _load_plan(settings: Settings) -> Plan:
+    plan = read_model(settings.paths.plan, Plan)
+    if plan is None:
+        raise typer.BadParameter("no plan found, run: kts plan")
+    return plan
+
+
+@app.callback()
+def main_options(
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Log API-level detail.")] = False,
+) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
     )
-    if args.fix and problems:
-        await verify.apply_fixes(plan, report, client)
-        print("fixes applied, re-run verify to confirm")
-    elif not problems:
-        print("account matches the plan exactly")
+
+
+@app.command()
+def auth(service: Annotated[Service, typer.Argument(help="Which service to authorize.")]) -> None:
+    """Authorize a service through its device-code flow."""
+
+    async def run() -> None:
+        settings = _settings()
+        if service is Service.KINOPUB:
+            async with KinopubClient(settings) as client:
+                await client.device_auth()
+        else:
+            async with TraktClient(settings) as client:
+                await client.device_auth()
+
+    asyncio.run(run())
+
+
+@app.command(name="pull")
+def pull_command() -> None:
+    """Dump watch history and progress from kino.pub into data/."""
+    asyncio.run(pull(_settings()))
+
+
+@app.command(name="plan")
+def plan_command() -> None:
+    """Build a sync plan from the dump, reconciling Trakt episode identities."""
+
+    async def run() -> None:
+        settings = _settings()
+        dump = read_model(settings.paths.dump, Dump)
+        if dump is None:
+            raise typer.BadParameter("no dump found, run: kts pull")
+
+        plan = transform.build_plan(dump)
+        catalog_cache = read_json(settings.paths.trakt_cache, default={})
+        decision_cache = read_json(settings.paths.reconcile_cache, default={})
+        async with TraktClient(settings) as client:
+            plan = await reconcile_plan(
+                plan,
+                dump,
+                Catalog(client, catalog_cache),
+                Gemini(settings),
+                DecisionCache(decision_cache),
+            )
+        write_json(settings.paths.trakt_cache, catalog_cache)
+        write_json(settings.paths.reconcile_cache, decision_cache)
+        write_model(settings.paths.plan, plan)
+
+        for note in plan.notes:
+            print(f"reconcile: {note}")
+        print(transform.format_summary(plan))
+        print(f"plan saved: {settings.paths.plan}")
+
+    asyncio.run(run())
+
+
+@app.command(name="push")
+def push_command(
+    history: Annotated[bool, typer.Option("--history", help="Watched movies and episodes.")] = False,
+    progress: Annotated[bool, typer.Option("--progress", help="Playback position of unfinished items.")] = False,
+    watchlist: Annotated[bool, typer.Option("--watchlist", help="kino.pub watchlist shows.")] = False,
+    all_sections: Annotated[bool, typer.Option("--all", help="History, progress and watchlist.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Only report what would be pushed.")] = False,
+) -> None:
+    """Apply the plan to Trakt."""
+    if not (history or progress or watchlist or all_sections):
+        raise typer.BadParameter("select --history / --progress / --watchlist / --all")
+
+    async def run() -> None:
+        settings = _settings()
+        plan = _load_plan(settings)
+        state = PushState.load(settings.paths.push_state)
+        async with TraktClient(settings) as client:
+            for selected, action in (
+                (history or all_sections, push_history),
+                (progress or all_sections, push_progress),
+                (watchlist or all_sections, push_watchlist),
+            ):
+                if selected:
+                    await action(plan, client, state, settings.paths.push_state, dry_run=dry_run)
+
+    asyncio.run(run())
+
+
+@app.command(name="verify")
+def verify_command(
+    fix: Annotated[bool, typer.Option("--fix", help="Remove wrong events and push missing ones.")] = False,
+) -> None:
+    """Check the Trakt account against the plan, entry by entry."""
+
+    async def run() -> None:
+        settings = _settings()
+        plan = _load_plan(settings)
+        async with TraktClient(settings) as client:
+            report = await verify.build_report(plan, client)
+            print(verify.format_report(report))
+            write_model(settings.paths.verify_report, report)
+
+            if not report.problem_count:
+                print("account matches the plan exactly")
+            elif fix:
+                await verify.apply_fixes(plan, report, client, settings.paths.push_state)
+                print("fixes applied, re-run verify to confirm")
+
+    asyncio.run(run())
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="kts", description="One-way sync of kino.pub watch data to Trakt"
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    auth = sub.add_parser("auth", help="authorize a service (device code flow)")
-    auth.add_argument("service", choices=["kinopub", "trakt"])
-
-    sub.add_parser("pull", help="dump watch data from kino.pub into data/")
-    sub.add_parser("plan", help="build a sync plan (with Trakt identity reconciliation) and print a summary")
-
-    ver = sub.add_parser("verify", help="element-wise check of the Trakt account against the plan")
-    ver.add_argument("--fix", action="store_true", help="remove wrong events and push missing ones")
-
-    push_cmd = sub.add_parser("push", help="apply the plan to Trakt")
-    push_cmd.add_argument("--history", action="store_true", help="watched movies and episodes")
-    push_cmd.add_argument("--progress", action="store_true", help="playback progress of unfinished items")
-    push_cmd.add_argument("--watchlist", action="store_true", help="kino.pub watchlist shows")
-    push_cmd.add_argument("--all", action="store_true", help="history + progress + watchlist")
-    push_cmd.add_argument("--dry-run", action="store_true", help="only report what would be pushed")
-
-    args = parser.parse_args()
-
-    if args.command == "auth":
-        if args.service == "kinopub":
-            asyncio.run(KinopubClient().device_auth())
-        else:
-            asyncio.run(TraktClient().device_auth())
-    elif args.command == "pull":
-        asyncio.run(pull())
-    elif args.command == "plan":
-        asyncio.run(_plan())
-    elif args.command == "push":
-        asyncio.run(_push(args))
-    elif args.command == "verify":
-        asyncio.run(_verify(args))
+    app()
 
 
 if __name__ == "__main__":
