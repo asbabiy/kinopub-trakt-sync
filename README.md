@@ -69,6 +69,18 @@ percent against the live account and reports missing / extra / mismatched.
   batched 500 entries per request. The kino.pub pull sleeps 200 ms between items.
 - Tokens live in `data/tokens.json` (chmod 600); the whole `data/` dir is gitignored.
 
+## What is intentionally not transferred
+
+- **Ratings/votes** — the kino.pub API does not expose the user's own votes at
+  all: voting is write-only (`/v1/items/vote?id=&like=`, binary like/dislike),
+  item payloads carry only community stats and no `my vote` field. There is
+  nothing to read.
+- **`counter` from history** — it counts player sessions, not rewatches (a
+  movie watched in two sittings has counter=2), so mapping it to Trakt plays
+  would fabricate rewatch history.
+- **`first_seen`** — Trakt stores one datetime per play; the completion moment
+  (`updated`) is what "watched at" means.
+
 ## kino.pub API notes
 
 Documented at <https://kinoapi.com>. Endpoints used: `/v1/history` (paginated view
