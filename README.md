@@ -13,13 +13,15 @@ one are reported as `unmatched` for manual review, never guessed.
 
 ```bash
 uv sync
-cp .env.example .env   # fill in Trakt app credentials
 ```
 
-Trakt requires your own API app: create one at <https://trakt.tv/oauth/applications>
-(redirect uri `urn:ietf:wg:oauth:2.0:oob`), put its client id/secret into `.env`.
-kino.pub needs no registration — the shared public client credentials used by
-open-source clients (`xbmc`) are built in.
+No registration or paid tier is needed on either side. Both services authorize
+via OAuth device-code flow, whose security rests on your own sign-in rather than
+on a secret client key, so both sides ship with the public client credentials
+used by open-source clients — `xbmc` for kino.pub, iamkroot/trakt-scrobbler's for
+Trakt. (Trakt put creating a *new* API app behind VIP in 2025, but the API
+methods this tool uses are free; reusing an existing public device-flow client
+sidesteps app creation entirely.) Override in `.env` only if you own a Trakt app.
 
 ## Usage
 

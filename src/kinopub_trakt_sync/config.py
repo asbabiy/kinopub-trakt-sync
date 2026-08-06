@@ -33,8 +33,21 @@ KINOPUB_CLIENT_ID = os.environ.get("KINOPUB_CLIENT_ID", "xbmc")
 KINOPUB_CLIENT_SECRET = os.environ.get("KINOPUB_CLIENT_SECRET", "cgg3gtifu46urtfp2zp1nqtba0k2ezxh")
 
 TRAKT_API = "https://api.trakt.tv"
-TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
-TRAKT_CLIENT_SECRET = os.environ.get("TRAKT_CLIENT_SECRET", "")
+# Trakt gated new API-app creation behind VIP in early 2025, but the device-code
+# flow needs no per-user app: security comes from the user's own authorization,
+# not from client_secret being secret. These are the public credentials shipped
+# by the open-source iamkroot/trakt-scrobbler client (base64 in its
+# trakt_key_holder.py), a multi-user device-flow scrobbler. The endpoints we call
+# (/sync/history, /scrobble/pause, /sync/watchlist) are free, not VIP-only.
+# Override with your own app in .env if you have one.
+TRAKT_CLIENT_ID = os.environ.get(
+    "TRAKT_CLIENT_ID",
+    "ab0133a2365b2c64d70fd2adf3c7e775a4131471b56340933335af1b94785a3a",
+)
+TRAKT_CLIENT_SECRET = os.environ.get(
+    "TRAKT_CLIENT_SECRET",
+    "b574acd5857310fcdc1e195c5953795fc61a1d89d69fec1649624d54cb666222",
+)
 
 
 def load_tokens() -> dict:
