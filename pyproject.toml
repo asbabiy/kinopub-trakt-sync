@@ -3,7 +3,7 @@ name = "kinopub-trakt-sync"
 version = "0.1.0"
 description = "One-way migration of watch history, playback progress and watchlist from kino.pub to Trakt"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Alexander Babiy", email = "55639869+asbabiy@users.noreply.github.com" }]
@@ -12,7 +12,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Video",
     "Typing :: Typed",
@@ -60,7 +59,7 @@ asyncio_mode = "auto"
 [tool.basedpyright]
 include = ["src"]
 typeCheckingMode = "strict"
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 executionEnvironments = [{ root = "src" }]
 # API payloads are external JSON: they enter as Any at the client boundary and
 # are validated into models.py types right after. Unknown-propagation from
@@ -73,7 +72,7 @@ reportUnknownArgumentType = false
 reportUnknownVariableType = false
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 src = ["src"]
 line-length = 110
 
