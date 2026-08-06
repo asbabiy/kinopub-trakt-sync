@@ -53,9 +53,7 @@ class PushState(BaseModel):
 def history_payload(movies: list[MovieWatch], episodes: list[EpisodeWatch]) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if movies:
-        body["movies"] = [
-            {"watched_at": movie.watched_at, "ids": {"imdb": movie.imdb}} for movie in movies
-        ]
+        body["movies"] = [{"watched_at": movie.watched_at, "ids": {"imdb": movie.imdb}} for movie in movies]
     if episodes:
         shows: dict[ShowRef, dict[int, list[dict[str, Any]]]] = {}
         for entry in episodes:
@@ -68,8 +66,7 @@ def history_payload(movies: list[MovieWatch], episodes: list[EpisodeWatch]) -> d
             {
                 "ids": Target(show=show, season=0, episode=0).ids,
                 "seasons": [
-                    {"number": number, "episodes": episodes}
-                    for number, episodes in sorted(seasons.items())
+                    {"number": number, "episodes": episodes} for number, episodes in sorted(seasons.items())
                 ],
             }
             for show, seasons in shows.items()
@@ -169,9 +166,7 @@ async def push_watchlist(
     if dry_run or not entries:
         return
 
-    result = await client.add_to_watchlist(
-        {"shows": [{"ids": {"imdb": show.imdb}} for show in entries]}
-    )
+    result = await client.add_to_watchlist({"shows": [{"ids": {"imdb": show.imdb}} for show in entries]})
     state.record(entries)
     state.save(state_path)
     print(f"  added {result.get('added', {}).get('shows', 0)} shows to watchlist")

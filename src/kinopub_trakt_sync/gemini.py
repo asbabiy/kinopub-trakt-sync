@@ -39,9 +39,7 @@ class Gemini:
     def _connect(self) -> genai.Client:
         if self._client is None:
             if not self._settings.gemini_api_key:
-                raise MatcherError(
-                    "this plan needs episode matching, which requires GEMINI_API_KEY in .env"
-                )
+                raise MatcherError("this plan needs episode matching, which requires GEMINI_API_KEY in .env")
             self._client = genai.Client(api_key=self._settings.gemini_api_key)
         return self._client
 

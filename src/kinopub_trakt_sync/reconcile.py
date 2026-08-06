@@ -113,9 +113,9 @@ class Catalog:
     async def seasons(self, show: ShowRef) -> dict[int, list[TraktEpisode]]:
         """Season number -> episodes. Empty when Trakt does not know the show:
         an unknown imdb id answers 200 with an empty list, not 404."""
-        payload: list[dict[str, Any]] = await self._get(
-            f"/shows/{show}/seasons", extended="episodes,full"
-        ) or []
+        payload: list[dict[str, Any]] = (
+            await self._get(f"/shows/{show}/seasons", extended="episodes,full") or []
+        )
         return {
             season["number"]: [
                 TraktEpisode.model_validate(episode) for episode in season.get("episodes") or []
@@ -124,9 +124,9 @@ class Catalog:
         }
 
     async def russian_titles(self, show: ShowRef, season: int) -> dict[int, str]:
-        payload: list[dict[str, Any]] = await self._get(
-            f"/shows/{show}/seasons/{season}", translations="ru"
-        ) or []
+        payload: list[dict[str, Any]] = (
+            await self._get(f"/shows/{show}/seasons/{season}", translations="ru") or []
+        )
         return {
             episode["number"]: translation["title"]
             for episode in payload
@@ -279,18 +279,14 @@ async def reconcile_season(
 
     if len(kp_episodes) <= len(trakt_episodes):
         # Counts agree, or the season is still airing: numbering is trustworthy.
-        return SeasonMatch(
-            mapping={n: Target(show=show, season=season, episode=n) for n in kp_numbers}
-        )
+        return SeasonMatch(mapping={n: Target(show=show, season=season, episode=n) for n in kp_numbers})
 
     fingerprint = cache.fingerprint(show, season, kp_episodes)
     if cached := cache.get(fingerprint):
         log.debug("reconcile: cache hit for %s season %s", show_title, season)
         return cached
 
-    candidates = _candidate_payload(
-        show, season, trakt_episodes, await catalog.russian_titles(show, season)
-    )
+    candidates = _candidate_payload(show, season, trakt_episodes, await catalog.russian_titles(show, season))
     # Specials live in season 0 — of this show, and of same-titled shows, since
     # era reboots host cross-over specials.
     specials_sources: list[tuple[ShowRef, dict[int, list[TraktEpisode]]]] = [(show, trakt_seasons)]
@@ -301,9 +297,7 @@ async def reconcile_season(
             specials_sources.append((candidate.trakt, seasons))
     for source, seasons in specials_sources:
         if specials := seasons.get(0):
-            candidates += _candidate_payload(
-                source, 0, specials, await catalog.russian_titles(source, 0)
-            )
+            candidates += _candidate_payload(source, 0, specials, await catalog.russian_titles(source, 0))
 
     answer = await llm.structured(
         SEASON_MATCH.format(

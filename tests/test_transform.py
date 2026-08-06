@@ -14,15 +14,11 @@ DUMP = Dump.model_validate(
         "watching": {
             "1": {
                 "id": 1,
-                "videos": [
-                    {"number": 1, "duration": 6000, "time": 6000, "status": 1, "updated": 1600000000}
-                ],
+                "videos": [{"number": 1, "duration": 6000, "time": 6000, "status": 1, "updated": 1600000000}],
             },
             "2": {
                 "id": 2,
-                "videos": [
-                    {"number": 1, "duration": 6000, "time": 3000, "status": 0, "updated": 1600000001}
-                ],
+                "videos": [{"number": 1, "duration": 6000, "time": 3000, "status": 0, "updated": 1600000001}],
             },
             "3": {
                 "id": 3,
@@ -153,9 +149,7 @@ def test_state_keys_are_stable():
     account: these key formats must not drift."""
     assert MovieWatch(kinopub_id=1, title="t", imdb="tt1", watched_at="unknown").state_key == "movie:tt1"
     assert (
-        EpisodeWatch(
-            kinopub_id=1, title="t", imdb="tt1", season=2, episode=3, watched_at="unknown"
-        ).state_key
+        EpisodeWatch(kinopub_id=1, title="t", imdb="tt1", season=2, episode=3, watched_at="unknown").state_key
         == "episode:tt1:2:3"
     )
     assert Progress(kinopub_id=1, title="t", imdb="tt1", percent=5).state_key == "progress:movie:tt1"

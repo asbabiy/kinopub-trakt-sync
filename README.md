@@ -39,6 +39,10 @@ Trakt. (Trakt put creating a *new* API app behind VIP in 2025, but the API
 methods this tool uses are free; reusing an existing public device-flow client
 sidesteps app creation entirely.) Override in `.env` only if you own a Trakt app.
 
+Those Trakt credentials belong to another project, so its owner can revoke them
+at any time — should `kts auth trakt` ever start failing with `invalid_client`,
+put your own `TRAKT_CLIENT_ID` / `TRAKT_CLIENT_SECRET` into `.env`.
+
 ## Usage
 
 Authorize once, then sync:
@@ -145,3 +149,7 @@ per-episode `status` as `-1` unwatched, `0` in progress, `1` watched, alongside
 `time` (position in seconds) and `updated` (unix time of the last status
 change). Authorization is an OAuth2 device-code flow against `/oauth2/device`.
 The official documentation lives at <https://kinoapi.com>.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Not affiliated with kino.pub or Trakt.

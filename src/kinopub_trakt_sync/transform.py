@@ -80,9 +80,7 @@ def _movie_entries(
     )
     if percent is None:
         return None, None
-    progress = Progress(
-        kinopub_id=item.id, title=item.title, year=item.year, imdb=imdb, percent=percent
-    )
+    progress = Progress(kinopub_id=item.id, title=item.title, year=item.year, imdb=imdb, percent=percent)
     return None, progress
 
 
@@ -130,9 +128,7 @@ def build_plan(dump: Dump) -> Plan:
         imdb = imdb_id(item)
         if imdb is None:
             plan.unmatched.append(
-                Unmatched(
-                    title=item.title, reason="no imdb id", kinopub_id=item.id, year=item.year
-                )
+                Unmatched(title=item.title, reason="no imdb id", kinopub_id=item.id, year=item.year)
             )
             continue
         watching = dump.watching.get(item_id)
@@ -148,9 +144,7 @@ def build_plan(dump: Dump) -> Plan:
             plan.progress.extend(episode_progress)
 
     for entry in dump.watchlist:
-        item = dump.items.get(str(entry.id)) or KinopubItem(
-            id=entry.id, title=entry.title, year=entry.year
-        )
+        item = dump.items.get(str(entry.id)) or KinopubItem(id=entry.id, title=entry.title, year=entry.year)
         imdb = imdb_id(item)
         if imdb is None:
             plan.unmatched.append(
@@ -162,9 +156,7 @@ def build_plan(dump: Dump) -> Plan:
                 )
             )
             continue
-        plan.watchlist.append(
-            WatchlistShow(kinopub_id=entry.id, title=item.title, year=item.year, imdb=imdb)
-        )
+        plan.watchlist.append(WatchlistShow(kinopub_id=entry.id, title=item.title, year=item.year, imdb=imdb))
 
     return plan
 
@@ -178,7 +170,9 @@ def format_summary(plan: Plan, unmatched_preview: int = 15) -> str:
         f"watchlist:        {stats.watchlist}",
         f"unmatched:        {stats.unmatched}",
     ]
-    lines += [f"  - {entry.title} ({entry.year}): {entry.reason}" for entry in plan.unmatched[:unmatched_preview]]
+    lines += [
+        f"  - {entry.title} ({entry.year}): {entry.reason}" for entry in plan.unmatched[:unmatched_preview]
+    ]
     if stats.unmatched > unmatched_preview:
         lines.append(f"  ... and {stats.unmatched - unmatched_preview} more (see sync_plan.json)")
     return "\n".join(lines)

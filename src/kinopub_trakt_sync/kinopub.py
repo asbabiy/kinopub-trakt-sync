@@ -40,10 +40,7 @@ def _is_retryable(exc: BaseException) -> bool:
     """Network hiccups and throttling both deserve a retry; 404 and friends do not."""
     if isinstance(exc, httpx.TransportError):
         return True
-    return (
-        isinstance(exc, httpx.HTTPStatusError)
-        and exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS
-    )
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS
 
 
 class KinopubClient:

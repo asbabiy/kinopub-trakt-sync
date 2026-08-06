@@ -162,7 +162,9 @@ def plan_command() -> None:
 @app.command(name="push")
 def push_command(
     history: Annotated[bool, typer.Option("--history", help="Watched movies and episodes.")] = False,
-    progress: Annotated[bool, typer.Option("--progress", help="Playback position of unfinished items.")] = False,
+    progress: Annotated[
+        bool, typer.Option("--progress", help="Playback position of unfinished items.")
+    ] = False,
     watchlist: Annotated[bool, typer.Option("--watchlist", help="kino.pub watchlist shows.")] = False,
     all_sections: Annotated[bool, typer.Option("--all", help="History, progress and watchlist.")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Only report what would be pushed.")] = False,
@@ -200,7 +202,9 @@ def verify_command(
 
 @app.command(name="sync")
 def sync_command(
-    dry_run: Annotated[bool, typer.Option("--dry-run", help="Pull and plan, but write nothing to Trakt.")] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Pull and plan, but write nothing to Trakt.")
+    ] = False,
 ) -> None:
     """Run the whole pipeline: pull, plan, push, verify."""
 
@@ -208,9 +212,7 @@ def sync_command(
         settings = Settings()
         dump = await pull(settings)
         plan = await _plan_step(settings, dump)
-        await _push_step(
-            settings, plan, history=True, progress=True, watchlist=True, dry_run=dry_run
-        )
+        await _push_step(settings, plan, history=True, progress=True, watchlist=True, dry_run=dry_run)
         if dry_run:
             print("dry run: nothing was written to Trakt")
             return

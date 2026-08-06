@@ -223,9 +223,7 @@ def adopt_plan_as_state(plan: Plan, state_path: Path) -> None:
     state.save(state_path)
 
 
-async def apply_fixes(
-    plan: Plan, report: VerifyReport, client: TraktClient, state_path: Path
-) -> None:
+async def apply_fixes(plan: Plan, report: VerifyReport, client: TraktClient, state_path: Path) -> None:
     wrong_events = [event.event_id for event in report.extra_events] + [
         mismatch.event_id for mismatch in report.timestamp_mismatches
     ]
@@ -239,9 +237,7 @@ async def apply_fixes(
         movie for movie in plan.movies if (movie.title, None, None) in mismatched
     ]
     episodes = report.missing_episodes + [
-        episode
-        for episode in plan.episodes
-        if (episode.title, episode.season, episode.episode) in mismatched
+        episode for episode in plan.episodes if (episode.title, episode.season, episode.episode) in mismatched
     ]
     if movies or episodes:
         result = await client.add_to_history(history_payload(movies, episodes))
@@ -282,9 +278,7 @@ def format_report(report: VerifyReport) -> str:
     return "\n".join(lines)
 
 
-type ReportRow = (
-    MovieWatch | EpisodeWatch | Progress | TimestampMismatch | ProgressMismatch | ExtraEvent
-)
+type ReportRow = MovieWatch | EpisodeWatch | Progress | TimestampMismatch | ProgressMismatch | ExtraEvent
 
 
 def _describe(row: ReportRow) -> str:
