@@ -1,5 +1,5 @@
 from kinopub_trakt_sync import transform
-from kinopub_trakt_sync.push import _shows_payload
+from kinopub_trakt_sync.push import history_payload
 
 DUMP = {
     "items": {
@@ -74,15 +74,26 @@ def test_percent_bounds():
     assert transform._percent(3000, 0) is None
 
 
-def test_shows_payload_groups_by_show_and_season():
+def test_history_payload_groups_and_respects_targets():
     episodes = [
         {"imdb": "tt1", "season": 1, "episode": 1, "watched_at": "unknown"},
         {"imdb": "tt1", "season": 1, "episode": 2, "watched_at": "unknown"},
         {"imdb": "tt1", "season": 2, "episode": 1, "watched_at": "unknown"},
-        {"imdb": "tt2", "season": 1, "episode": 5, "watched_at": "unknown"},
+        # remapped entry: pushed to another show's season 0 by trakt id
+        {
+            "imdb": "tt1",
+            "season": 2,
+            "episode": 9,
+            "watched_at": "unknown",
+            "target": {"show": 213360, "season": 0, "episode": 5},
+        },
     ]
-    payload = _shows_payload(episodes)
+    payload = history_payload([], episodes)["shows"]
     assert len(payload) == 2
-    tt1 = next(s for s in payload if s["ids"]["imdb"] == "tt1")
+    tt1 = next(s for s in payload if s["ids"] == {"imdb": "tt1"})
     assert [s["number"] for s in tt1["seasons"]] == [1, 2]
     assert [e["number"] for e in tt1["seasons"][0]["episodes"]] == [1, 2]
+    other = next(s for s in payload if s["ids"] == {"trakt": 213360})
+    assert other["seasons"] == [
+        {"number": 0, "episodes": [{"number": 5, "watched_at": "unknown"}]}
+    ]

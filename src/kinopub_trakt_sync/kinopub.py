@@ -1,13 +1,16 @@
-"""kino.pub API client: device-code auth and read-only data extraction.
+"""kino.pub API client: device-code auth and concurrent read-only extraction.
 
 API reference: https://kinoapi.com/ (base https://api.service-kp.com/v1).
 """
 
+import asyncio
 import time
 
 import httpx
 
 from . import config
+
+CONCURRENCY = 16  # kino.pub is a small service; higher risks 429s/bans
 
 
 class KinopubError(RuntimeError):
@@ -16,12 +19,13 @@ class KinopubError(RuntimeError):
 
 class KinopubClient:
     def __init__(self) -> None:
-        self._http = httpx.Client(timeout=30)
+        self._http = httpx.AsyncClient(timeout=30)
+        self._sem = asyncio.Semaphore(CONCURRENCY)
 
     # -- auth ------------------------------------------------------------
 
-    def device_auth(self) -> None:
-        resp = self._http.post(
+    async def device_auth(self) -> None:
+        resp = await self._http.post(
             config.KINOPUB_DEVICE_URL,
             data={
                 "grant_type": "device_code",
@@ -34,8 +38,8 @@ class KinopubClient:
         print(f"Open {data['verification_uri']} and enter code: {data['user_code']}")
         deadline = time.time() + data.get("expires_in", 300)
         while time.time() < deadline:
-            time.sleep(data.get("interval", 5))
-            resp = self._http.post(
+            await asyncio.sleep(data.get("interval", 5))
+            resp = await self._http.post(
                 config.KINOPUB_DEVICE_URL,
                 data={
                     "grant_type": "device_token",
@@ -58,12 +62,12 @@ class KinopubClient:
         tokens["kinopub"] = payload
         config.save_tokens(tokens)
 
-    def _access_token(self) -> str:
+    async def _access_token(self) -> str:
         tokens = config.load_tokens().get("kinopub")
         if not tokens:
             raise KinopubError("not authorized, run: kts auth kinopub")
         if time.time() > tokens["obtained_at"] + tokens.get("expires_in", 3600) - 60:
-            resp = self._http.post(
+            resp = await self._http.post(
                 config.KINOPUB_TOKEN_URL,
                 data={
                     "grant_type": "refresh_token",
@@ -80,16 +84,17 @@ class KinopubClient:
 
     # -- data ------------------------------------------------------------
 
-    def get(self, path: str, **params) -> dict:
-        params["access_token"] = self._access_token()
-        resp = self._http.get(f"{config.KINOPUB_API}{path}", params=params)
+    async def get(self, path: str, **params) -> dict:
+        params["access_token"] = await self._access_token()
+        async with self._sem:
+            resp = await self._http.get(f"{config.KINOPUB_API}{path}", params=params)
         resp.raise_for_status()
         return resp.json()
 
-    def get_optional(self, path: str, **params):
+    async def get_optional(self, path: str, **params):
         """Like get(), but returns None on 404 (item deleted from catalog)."""
         try:
-            return self.get(path, **params)
+            return await self.get(path, **params)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return None
@@ -104,26 +109,27 @@ class KinopubClient:
                 return value
         return []
 
-    def history_pages(self):
-        page = 1
-        while True:
-            data = self.get("/v1/history", page=page, perpage=50)
-            yield data
-            pagination = data.get("pagination") or {}
-            if page >= int(pagination.get("total") or 0):
-                return
-            page += 1
+    async def history_all(self) -> list:
+        first = await self.get("/v1/history", page=1, perpage=50)
+        records = self.records(first)
+        total = int((first.get("pagination") or {}).get("total") or 1)
+        pages = await asyncio.gather(
+            *[self.get("/v1/history", page=p, perpage=50) for p in range(2, total + 1)]
+        )
+        for page_data in pages:
+            records.extend(self.records(page_data))
+        return records
 
-    def item(self, item_id: int) -> dict | None:
-        data = self.get_optional(f"/v1/items/{item_id}")
+    async def item(self, item_id: int) -> dict | None:
+        data = await self.get_optional(f"/v1/items/{item_id}")
         return data["item"] if data else None
 
-    def watching(self, item_id: int) -> dict | None:
-        data = self.get_optional("/v1/watching", id=item_id)
+    async def watching(self, item_id: int) -> dict | None:
+        data = await self.get_optional("/v1/watching", id=item_id)
         return data["item"] if data else None
 
-    def unwatched_movies(self) -> list:
-        return self.records(self.get("/v1/watching/movies"))
+    async def unwatched_movies(self) -> list:
+        return self.records(await self.get("/v1/watching/movies"))
 
-    def watchlist(self) -> list:
-        return self.records(self.get("/v1/watching/serials", subscribed=1))
+    async def watchlist(self) -> list:
+        return self.records(await self.get("/v1/watching/serials", subscribed=1))

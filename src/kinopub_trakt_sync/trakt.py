@@ -1,14 +1,18 @@
 """Trakt API v2 client: device-code auth, history/watchlist sync, scrobble.
 
 API reference: https://trakt.docs.apiary.io/ (base https://api.trakt.tv).
-POST endpoints are rate-limited to 1 call per second.
+GETs run concurrently (bounded); POSTs are serialized at ~1 rps because Trakt
+hard-limits write calls to 1 per second — parallelism there only buys 429s.
 """
 
+import asyncio
 import time
 
 import httpx
 
 from . import config
+
+GET_CONCURRENCY = 8
 
 
 class TraktError(RuntimeError):
@@ -22,20 +26,21 @@ class TraktClient:
                 "TRAKT_CLIENT_ID / TRAKT_CLIENT_SECRET not set. Create an app at "
                 "https://trakt.tv/oauth/applications and put both into .env"
             )
-        self._http = httpx.Client(base_url=config.TRAKT_API, timeout=30)
+        self._http = httpx.AsyncClient(base_url=config.TRAKT_API, timeout=30)
+        self._sem = asyncio.Semaphore(GET_CONCURRENCY)
 
     # -- auth ------------------------------------------------------------
 
-    def device_auth(self) -> None:
-        resp = self._http.post("/oauth/device/code", json={"client_id": config.TRAKT_CLIENT_ID})
+    async def device_auth(self) -> None:
+        resp = await self._http.post("/oauth/device/code", json={"client_id": config.TRAKT_CLIENT_ID})
         resp.raise_for_status()
         data = resp.json()
         print(f"Open {data['verification_url']} and enter code: {data['user_code']}")
         deadline = time.time() + data.get("expires_in", 600)
         interval = data.get("interval", 5)
         while time.time() < deadline:
-            time.sleep(interval)
-            resp = self._http.post(
+            await asyncio.sleep(interval)
+            resp = await self._http.post(
                 "/oauth/device/token",
                 json={
                     "code": data["device_code"],
@@ -60,12 +65,12 @@ class TraktClient:
         tokens["trakt"] = payload
         config.save_tokens(tokens)
 
-    def _access_token(self) -> str:
+    async def _access_token(self) -> str:
         tokens = config.load_tokens().get("trakt")
         if not tokens:
             raise TraktError("not authorized, run: kts auth trakt")
         if time.time() > tokens["obtained_at"] + tokens.get("expires_in", 86400) - 300:
-            resp = self._http.post(
+            resp = await self._http.post(
                 "/oauth/token",
                 json={
                     "grant_type": "refresh_token",
@@ -83,38 +88,75 @@ class TraktClient:
 
     # -- requests --------------------------------------------------------
 
-    def _request(self, method: str, path: str, json_body: dict | None = None) -> httpx.Response:
+    async def _request(
+        self, method: str, path: str, json_body: dict | None = None, params: dict | None = None
+    ) -> httpx.Response:
         headers = {
             "trakt-api-version": "2",
             "trakt-api-key": config.TRAKT_CLIENT_ID,
-            "Authorization": f"Bearer {self._access_token()}",
+            "Authorization": f"Bearer {await self._access_token()}",
         }
         for _ in range(5):
-            resp = self._http.request(method, path, json=json_body, headers=headers)
+            async with self._sem:
+                resp = await self._http.request(
+                    method, path, json=json_body, params=params, headers=headers
+                )
             if resp.status_code == 429:
-                time.sleep(int(resp.headers.get("Retry-After", 2)))
+                await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
                 continue
             return resp
         raise TraktError(f"rate limited repeatedly on {path}")
 
-    def watched(self, media: str) -> list:
-        resp = self._request("GET", f"/sync/watched/{media}")
+    async def get_json(self, path: str, **params):
+        """GET returning parsed JSON, or None on 404."""
+        resp = await self._request("GET", path, params=params or None)
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
         return resp.json()
 
-    def sync_history(self, body: dict) -> dict:
-        resp = self._request("POST", "/sync/history", body)
+    async def paginated(self, path: str, **params) -> list:
+        """All pages; the first page reveals the page count, the rest fetch
+        concurrently."""
+        first = await self._request("GET", path, params={**params, "page": 1, "limit": 100})
+        first.raise_for_status()
+        rows = first.json()
+        pages = int(first.headers.get("x-pagination-page-count") or 1)
+        if pages > 1:
+            results = await asyncio.gather(
+                *[
+                    self._request("GET", path, params={**params, "page": p, "limit": 100})
+                    for p in range(2, pages + 1)
+                ]
+            )
+            for resp in results:
+                resp.raise_for_status()
+                rows.extend(resp.json())
+        return rows
+
+    async def watched(self, media: str) -> list:
+        resp = await self._request("GET", f"/sync/watched/{media}")
         resp.raise_for_status()
         return resp.json()
 
-    def sync_watchlist(self, body: dict) -> dict:
-        resp = self._request("POST", "/sync/watchlist", body)
+    async def sync_history(self, body: dict) -> dict:
+        resp = await self._request("POST", "/sync/history", body)
         resp.raise_for_status()
         return resp.json()
 
-    def scrobble_pause(self, body: dict) -> str:
+    async def history_remove(self, event_ids: list) -> dict:
+        resp = await self._request("POST", "/sync/history/remove", {"ids": event_ids})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def sync_watchlist(self, body: dict) -> dict:
+        resp = await self._request("POST", "/sync/watchlist", body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def scrobble_pause(self, body: dict) -> str:
         """Saves playback progress. Returns outcome: ok | duplicate | rejected."""
-        resp = self._request("POST", "/scrobble/pause", body)
+        resp = await self._request("POST", "/scrobble/pause", body)
         if resp.status_code == 409:
             return "duplicate"
         if resp.status_code == 422:

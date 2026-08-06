@@ -9,6 +9,8 @@ TOKENS_FILE = DATA_DIR / "tokens.json"
 DUMP_FILE = DATA_DIR / "kinopub_dump.json"
 PLAN_FILE = DATA_DIR / "sync_plan.json"
 STATE_FILE = DATA_DIR / "push_state.json"
+TRAKT_CACHE_FILE = DATA_DIR / "trakt_cache.json"
+VERIFY_REPORT_FILE = DATA_DIR / "verify_report.json"
 
 
 def _load_dotenv() -> None:
@@ -33,6 +35,9 @@ KINOPUB_CLIENT_ID = os.environ.get("KINOPUB_CLIENT_ID", "xbmc")
 KINOPUB_CLIENT_SECRET = os.environ.get("KINOPUB_CLIENT_SECRET", "cgg3gtifu46urtfp2zp1nqtba0k2ezxh")
 
 TRAKT_API = "https://api.trakt.tv"
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 # Trakt gated new API-app creation behind VIP in early 2025, but the device-code
 # flow needs no per-user app: security comes from the user's own authorization,
 # not from client_secret being secret. These are the public credentials shipped
