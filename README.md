@@ -75,9 +75,12 @@ percent against the live account and reports missing / extra / mismatched.
   all: voting is write-only (`/v1/items/vote?id=&like=`, binary like/dislike),
   item payloads carry only community stats and no `my vote` field. There is
   nothing to read.
-- **`counter` from history** — it counts player sessions, not rewatches (a
-  movie watched in two sittings has counter=2), so mapping it to Trakt plays
-  would fabricate rewatch history.
+- **`counter` from history** — it is a technical player-access counter, not a
+  view count: one 90-minute episode shows counter=339 within a single day,
+  ordinary single-sitting movies show 1–2. kino.pub has no rewatch data at
+  all (history keeps one record per episode/video; re-watching just bumps
+  last_seen/counter), so mapping counter to Trakt plays would fabricate
+  rewatch history.
 - **`first_seen`** — Trakt stores one datetime per play; the completion moment
   (`updated`) is what "watched at" means.
 
