@@ -210,6 +210,19 @@ async def build_report(plan: Plan, client: TraktClient) -> VerifyReport:
     return report
 
 
+def adopt_plan_as_state(plan: Plan, state_path: Path) -> None:
+    """Record the whole plan as pushed.
+
+    Called once the account has been shown to match the plan: every entry
+    demonstrably reached Trakt, so the local state must say so. This also
+    repairs a state file written by an older version with different keys —
+    otherwise entries look unpushed forever and get sent again.
+    """
+    state = PushState()
+    state.record([*plan.movies, *plan.episodes, *plan.progress, *plan.watchlist])
+    state.save(state_path)
+
+
 async def apply_fixes(
     plan: Plan, report: VerifyReport, client: TraktClient, state_path: Path
 ) -> None:
@@ -242,9 +255,7 @@ async def apply_fixes(
         await asyncio.sleep(WRITE_INTERVAL_SECONDS)
 
     # The account now reflects the plan, so the local state must say the same.
-    state = PushState()
-    state.record([*plan.movies, *plan.episodes, *plan.progress, *plan.watchlist])
-    state.save(state_path)
+    adopt_plan_as_state(plan, state_path)
 
 
 def format_report(report: VerifyReport) -> str:

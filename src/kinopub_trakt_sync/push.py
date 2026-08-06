@@ -90,9 +90,12 @@ def progress_payload(entry: Progress) -> dict[str, Any]:
 async def watched_on_trakt(client: TraktClient) -> tuple[set[ShowRef], set[tuple[ShowRef, int, int]]]:
     """Everything the account already counts as watched, indexed by every id
     Trakt exposes, so imdb-addressed and trakt-addressed entries both match."""
+    # Only the ids we address items by: Trakt also nests objects here (`plex`
+    # is a dict), so taking every value would be both wrong and unhashable.
     movies: set[ShowRef] = set()
     for row in await client.watched("movies"):
-        movies.update(ref for ref in ((row.get("movie") or {}).get("ids") or {}).values() if ref)
+        ids = (row.get("movie") or {}).get("ids") or {}
+        movies.update(ref for ref in (ids.get("imdb"), ids.get("trakt")) if ref)
 
     episodes: set[tuple[ShowRef, int, int]] = set()
     for row in await client.watched("shows"):

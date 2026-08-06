@@ -12,19 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from typing import Any
 
 from rich.progress import Progress
 
 from .kinopub import KinopubClient
+from .models import Dump
 from .settings import Settings
-from .storage import write_json
+from .storage import write_model
 
 log = logging.getLogger(__name__)
 
 
-async def pull(settings: Settings) -> dict[str, Any]:
+async def pull(settings: Settings) -> Dump:
     async with KinopubClient(settings) as client:
         history = await client.history()
         print(f"history: {len(history)} records")
@@ -48,30 +50,39 @@ async def pull(settings: Settings) -> dict[str, Any]:
 
         watching: dict[str, Any] = {}
         missing: list[int] = []
-        with Progress(transient=True) as progress:
-            task = progress.add_task("watch states", total=len(item_ids))
-            for coroutine in asyncio.as_completed([fetch(item_id) for item_id in item_ids]):
-                item_id, state, metadata = await coroutine
-                if state is not None:
-                    watching[str(item_id)] = state
-                if metadata is not None:
-                    items[str(item_id)] = metadata
-                elif str(item_id) not in items:
-                    missing.append(item_id)
-                progress.advance(task)
+        tasks = [asyncio.create_task(fetch(item_id)) for item_id in item_ids]
+        try:
+            with Progress(transient=True, disable=not sys.stdout.isatty()) as progress:
+                bar = progress.add_task("watch states", total=len(tasks))
+                for completed in asyncio.as_completed(tasks):
+                    item_id, state, metadata = await completed
+                    if state is not None:
+                        watching[str(item_id)] = state
+                    if metadata is not None:
+                        items[str(item_id)] = metadata
+                    elif str(item_id) not in items:
+                        missing.append(item_id)
+                    progress.advance(bar)
+        finally:
+            # Without this, a failure would leave siblings running against a
+            # closed client and bury the original error under the fallout.
+            for task in tasks:
+                task.cancel()
 
-    dump = {
-        "pulled_at": int(time.time()),
-        "history": history,
-        "items": items,
-        "watching": watching,
-        "watchlist": watchlist,
-    }
-    write_json(settings.paths.dump, dump)
+    dump = Dump.model_validate(
+        {
+            "pulled_at": int(time.time()),
+            "history": history,
+            "items": items,
+            "watching": watching,
+            "watchlist": watchlist,
+        }
+    )
+    write_model(settings.paths.dump, dump)
     if missing:
         print(f"skipped {len(missing)} ids with no metadata (deleted, absent from history)")
     print(
         f"dump saved: {settings.paths.dump} "
-        f"({len(items)} items, {len(watching)} watch states, {len(history)} history records)"
+        f"({len(dump.items)} items, {len(dump.watching)} watch states, {len(history)} history records)"
     )
     return dump

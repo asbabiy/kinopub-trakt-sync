@@ -25,11 +25,25 @@ class MatcherError(RuntimeError):
 
 
 class Gemini:
+    """The client is built on first use, not at construction.
+
+    Most runs need no matching at all — seasons whose episode counts agree, and
+    cached decisions, never reach the model — so requiring an API key upfront
+    would fail plans that were never going to call it.
+    """
+
     def __init__(self, settings: Settings) -> None:
-        if not settings.gemini_api_key:
-            raise MatcherError("GEMINI_API_KEY not set — put it in .env")
-        self._client = genai.Client(api_key=settings.gemini_api_key)
-        self._model = settings.gemini_model
+        self._settings = settings
+        self._client: genai.Client | None = None
+
+    def _connect(self) -> genai.Client:
+        if self._client is None:
+            if not self._settings.gemini_api_key:
+                raise MatcherError(
+                    "this plan needs episode matching, which requires GEMINI_API_KEY in .env"
+                )
+            self._client = genai.Client(api_key=self._settings.gemini_api_key)
+        return self._client
 
     @retry(
         retry=retry_if_exception_type(MatcherError),
@@ -38,8 +52,8 @@ class Gemini:
         reraise=True,
     )
     async def structured[T: BaseModel](self, prompt: str, schema: type[T]) -> T:
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
+        response = await self._connect().aio.models.generate_content(
+            model=self._settings.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",

@@ -17,21 +17,33 @@ from types import TracebackType
 from typing import Any, Self
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .settings import KINOPUB_API, KINOPUB_DEVICE_URL, KINOPUB_TOKEN_URL, Settings
 from .storage import read_json, write_secret_json
 
 log = logging.getLogger(__name__)
 
-# kino.pub is a small service: more parallelism buys 429s, not speed.
-CONCURRENCY = 16
+# kino.pub is a small service and throttles readily: this is the level that
+# empirically completes a full pull without tripping 429s in bursts.
+CONCURRENCY = 8
 HISTORY_PAGE_SIZE = 50  # API hard cap
 POLL_TIMEOUT_SECONDS = 300
+MAX_ATTEMPTS = 5
 
 
 class KinopubError(RuntimeError):
     pass
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Network hiccups and throttling both deserve a retry; 404 and friends do not."""
+    if isinstance(exc, httpx.TransportError):
+        return True
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    )
 
 
 class KinopubClient:
@@ -111,9 +123,9 @@ class KinopubClient:
     # -- transport -------------------------------------------------------
 
     @retry(
-        retry=retry_if_exception_type(httpx.TransportError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(min=1, max=10),
+        retry=retry_if_exception(_is_retryable),
+        stop=stop_after_attempt(MAX_ATTEMPTS),
+        wait=wait_exponential(min=1, max=20),
         reraise=True,
     )
     async def get(self, path: str, **params: Any) -> dict[str, Any]:

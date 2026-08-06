@@ -38,21 +38,36 @@ sidesteps app creation entirely.) Override in `.env` only if you own a Trakt app
 
 ## Usage
 
+Authorize once, then sync:
+
 ```bash
 uv run kts auth kinopub   # prints a code to enter at kino.pub/device
 uv run kts auth trakt     # prints a code to enter at trakt.tv/activate
+uv run kts sync --dry-run # pull, plan, and report what would be written
+uv run kts sync           # the whole pipeline, ending in a verification pass
+uv run kts status         # local state: dump age, pending pushes, authorization
+```
+
+The individual stages exist for when one needs inspecting on its own:
+
+```bash
 uv run kts pull           # dump history + per-item progress -> data/kinopub_dump.json
 uv run kts plan           # build reconciled sync plan + summary -> data/sync_plan.json
-uv run kts push --all --dry-run
-uv run kts push --all
+uv run kts push --all     # or --history / --progress / --watchlist
 uv run kts verify         # element-wise audit of the account against the plan
 uv run kts verify --fix   # remove wrong events, push missing ones
 ```
 
-`push` accepts `--history`, `--progress`, `--watchlist` individually.
-`plan` needs `GEMINI_API_KEY` in `.env` for the identity reconciliation.
 `verify` compares every play (identity and watched_at) and every playback
-percent against the live account and reports missing / extra / mismatched.
+percent against the live account. `sync` runs it but never repairs
+automatically, because repairing deletes history events.
+
+`GEMINI_API_KEY` in `.env` is needed only when a plan actually has seasons to
+match — count-consistent seasons and cached decisions never reach the model.
+
+**Re-authorization deadline:** kino.pub invalidates a refresh token after 30
+days of disuse, after which `kts auth kinopub` is required again. `kts status`
+shows the days remaining.
 
 ## Behavior notes
 
