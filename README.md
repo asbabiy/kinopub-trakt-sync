@@ -23,10 +23,13 @@ uncertain is reported as `unmatched`, never guessed.
 uv sync
 ```
 
-Python 3.12+, `uv` for everything. The pipeline is async end to end (httpx +
-asyncio), the domain is pydantic models validated at the API boundary, the CLI
-is typer, and identity matching uses Gemini with a pydantic response schema.
-`ruff check` and `basedpyright` (strict) both run clean.
+Python 3.12+, `uv` for everything. The pipeline is async end to end; API
+payloads are validated into pydantic models at the boundary, so anything
+downstream of a client is typed.
+
+```bash
+uv run pytest && uv run ruff check src tests && uv run basedpyright
+```
 
 No registration or paid tier is needed on either side. Both services authorize
 via OAuth device-code flow, whose security rests on your own sign-in rather than
@@ -79,21 +82,21 @@ shows the days remaining.
   is sent with `watched_at: "unknown"` — Trakt marks it watched without a date.
   Trakt stores watched_at with minute precision (seconds are zeroed), so `verify`
   compares timestamps truncated to the minute.
-- **Concurrency.** All reads are concurrent: the kino.pub pull (semaphore 16 —
-  it is a small service, more invites 429s/bans), Trakt catalog/history GETs
-  (semaphore 8 within Trakt's 1000-per-5-min budget), and Gemini season
-  matching. Trakt POSTs stay serialized at 1 rps — a hard API limit.
+- **Reads are concurrent, writes are not.** The kino.pub pull runs 8 requests at
+  a time (it is a small service that throttles readily; 429s are retried with
+  backoff), Trakt GETs 8 at a time within its 1000-per-5-minute budget. Every
+  Trakt write stays serialized at one per second — a hard API limit, with
+  `Retry-After` honoured. History is batched 500 entries per request, while
+  progress costs one request per item because `/scrobble/pause` is the only
+  Trakt API that sets a playback position.
 - **Reconciliation is cached.** Model decisions are stored per season
   fingerprint (resolved show + exact kino.pub episode composition), so a repeat
   `plan` costs no tokens and returns the same mapping; new episodes change the
   fingerprint and re-ask.
 - **`push_state.json` key formats are a compatibility surface** — they are what
   makes a re-run idempotent on an already synced account. `models.py` owns them
-  and a test locks them.
-- **Progress** is pushed via `/scrobble/pause` (the only Trakt API that sets
-  playback position), one request per item at 1 rps.
-- **Rate limits.** Trakt POSTs run at 1/s with `Retry-After` handling; history is
-  batched 500 entries per request. The kino.pub pull sleeps 200 ms between items.
+  and a test locks them. A verification pass that finds no differences rewrites
+  the file from the plan, which also repairs keys written by older versions.
 - Tokens live in `data/tokens.json` (chmod 600); the whole `data/` dir is gitignored.
 
 ## What is intentionally not transferred
@@ -126,7 +129,7 @@ user signal is already consumed by `pull`:
 | `/v1/history` | per item: `time`, `first_seen`, `last_seen`, `counter` |
 | `/v1/watching?id=` | per episode: `status`, `time`, `updated` |
 | `/v1/watching/movies`, `/v1/watching/serials` | unfinished items, watchlist |
-| `/v1/bookmarks`, item field `bookmarks` | user folders (empty for this account) |
+| `/v1/bookmarks`, item field `bookmarks` | user-created folders |
 | `/v1/user` | username, reg date, subscription, `show_erotic`/`show_uncertain` |
 | `/v1/device` | device list with `last_seen` — session metadata, not watch data |
 
@@ -137,10 +140,8 @@ and caps `perpage` at 50. No `/v2`, no stats, notifications, or
 recommendations endpoints. `/v1/items/{id}` additionally serves `similar`,
 `comments`, and `trailer` — all catalog data.
 
-## kino.pub API notes
-
-Documented at <https://kinoapi.com>. Endpoints used: `/v1/history` (paginated view
-log), `/v1/items/{id}` (metadata incl. IMDb id), `/v1/watching?id=` (per-episode
-status/position: `-1` unwatched, `0` in progress, `1` watched, plus `time` and
-`updated`), `/v1/watching/movies`, `/v1/watching/serials?subscribed=1` (watchlist).
-Auth is an OAuth2 device-code flow against `/oauth2/device`.
+Field semantics worth knowing when reading the code: `/v1/watching?id=` reports
+per-episode `status` as `-1` unwatched, `0` in progress, `1` watched, alongside
+`time` (position in seconds) and `updated` (unix time of the last status
+change). Authorization is an OAuth2 device-code flow against `/oauth2/device`.
+The official documentation lives at <https://kinoapi.com>.
