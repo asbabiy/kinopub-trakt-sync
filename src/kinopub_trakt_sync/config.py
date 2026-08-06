@@ -57,14 +57,16 @@ def load_tokens() -> dict:
 
 
 def save_tokens(tokens: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+    save_json(TOKENS_FILE, tokens)
     TOKENS_FILE.chmod(0o600)
 
 
 def save_json(path: Path, payload: dict) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1))
+    # Atomic write so an interrupted checkpoint can't leave a truncated file.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1))
+    tmp.replace(path)
 
 
 def load_json(path: Path) -> dict:

@@ -86,6 +86,15 @@ class KinopubClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_optional(self, path: str, **params):
+        """Like get(), but returns None on 404 (item deleted from catalog)."""
+        try:
+            return self.get(path, **params)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+
     @staticmethod
     def records(page_data: dict) -> list:
         # Response payloads keep the record array under a varying key
@@ -105,11 +114,13 @@ class KinopubClient:
                 return
             page += 1
 
-    def item(self, item_id: int) -> dict:
-        return self.get(f"/v1/items/{item_id}")["item"]
+    def item(self, item_id: int) -> dict | None:
+        data = self.get_optional(f"/v1/items/{item_id}")
+        return data["item"] if data else None
 
-    def watching(self, item_id: int) -> dict:
-        return self.get("/v1/watching", id=item_id)["item"]
+    def watching(self, item_id: int) -> dict | None:
+        data = self.get_optional("/v1/watching", id=item_id)
+        return data["item"] if data else None
 
     def unwatched_movies(self) -> list:
         return self.records(self.get("/v1/watching/movies"))
